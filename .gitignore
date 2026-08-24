@@ -1,0 +1,11 @@
+/loomreg
+/dist/
+
+.env
+*.local.toml
+
+/var/
+
+.idea/
+.vscode/
+.DS_Store
