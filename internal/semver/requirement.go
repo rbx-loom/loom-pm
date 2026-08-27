@@ -1,6 +1,7 @@
 package semver
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -159,7 +160,16 @@ func parseClause(clause string) (lower, upper *Bound, err error) {
 		}
 	}
 
-	written, err := parsePartial(strings.TrimSpace(trimmed[len(comparator):]))
+	rest := strings.TrimSpace(trimmed[len(comparator):])
+
+	// caught here rather than left to ParseVersion, which would otherwise quote back the
+	// padded version this builds instead of what the author actually wrote
+	if rest != "" && !isVersionStart(rest[0]) {
+		return nil, nil, fmt.Errorf(
+			"version requirement clause %q does not begin with a version or a comparator", trimmed)
+	}
+
+	written, err := parsePartial(rest)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,16 +185,31 @@ func parseClause(clause string) (lower, upper *Bound, err error) {
 	case "<":
 		return nil, &Bound{version, false}, nil
 	case "~":
-		return &Bound{version, true}, &Bound{written.writtenCeiling(), false}, nil
+		return bounded(trimmed, version, written.writtenCeiling)
 	case "=":
 		if written.written == 3 {
 			return &Bound{version, true}, &Bound{version, true}, nil
 		}
-		return &Bound{version, true}, &Bound{written.writtenCeiling(), false}, nil
+		return bounded(trimmed, version, written.writtenCeiling)
 	default:
 		// a bare clause means caret
-		return &Bound{version, true}, &Bound{written.caretCeiling(), false}, nil
+		return bounded(trimmed, version, written.caretCeiling)
 	}
+}
+
+// bounded closes an interval with the ceiling the comparator derives, reporting the clause
+// as written when that ceiling does not exist.
+func bounded(clause string, version Version, ceiling func() (Version, error)) (*Bound, *Bound, error) {
+	limit, err := ceiling()
+	if err != nil {
+		return nil, nil, fmt.Errorf("version requirement %q: %w", clause, err)
+	}
+
+	return &Bound{version, true}, &Bound{limit, false}, nil
+}
+
+func isVersionStart(character byte) bool {
+	return character >= '0' && character <= '9'
 }
 
 func parsePartial(text string) (partial, error) {
@@ -229,31 +254,45 @@ func parsePartial(text string) (partial, error) {
 // cases are ordered, not independent.
 //
 //	^1.2.3 -> <2.0.0    ^0 -> <1.0.0    ^0.2.3 -> <0.3.0    ^0.0 -> <0.1.0    ^0.0.3 -> <0.0.4
-func (p partial) caretCeiling() Version {
+func (p partial) caretCeiling() (Version, error) {
 	switch {
 	case p.completed.Major != 0:
-		return Version{Major: p.completed.Major + 1}
+		return raise(p.completed.Major, func(next int) Version { return Version{Major: next} })
 	case p.written == 1:
-		return Version{Major: 1}
+		return Version{Major: 1}, nil
 	case p.completed.Minor != 0:
-		return Version{Minor: p.completed.Minor + 1}
+		return raise(p.completed.Minor, func(next int) Version { return Version{Minor: next} })
 	case p.written == 2:
-		return Version{Minor: 1}
+		return Version{Minor: 1}, nil
 	default:
-		return Version{Patch: p.completed.Patch + 1}
+		return raise(p.completed.Patch, func(next int) Version { return Version{Patch: next} })
 	}
 }
 
 // writtenCeiling is past everything the unwritten components could have been: the last
 // written component incremented. Three written components still move the minor, which is
 // what makes ~1.2.3 mean [1.2.3, 1.3.0).
-func (p partial) writtenCeiling() Version {
+func (p partial) writtenCeiling() (Version, error) {
 	if p.written == 1 {
-		return Version{Major: p.completed.Major + 1}
+		return raise(p.completed.Major, func(next int) Version { return Version{Major: next} })
 	}
 
-	return Version{Major: p.completed.Major, Minor: p.completed.Minor + 1}
+	major := p.completed.Major
+	return raise(p.completed.Minor, func(next int) Version { return Version{Major: major, Minor: next} })
 }
+
+// raise increments the component a ceiling sits on. A component already at MaxComponent
+// has no successor the client could parse, and a ceiling that saturated instead would
+// quietly accept versions the clause excludes.
+func raise(component int, build func(next int) Version) (Version, error) {
+	if component == MaxComponent {
+		return Version{}, errNoCeiling
+	}
+
+	return build(component + 1), nil
+}
+
+var errNoCeiling = errors.New("names the largest possible version component, so it has no ceiling")
 
 func tighterLower(left, right *Bound) *Bound {
 	switch {

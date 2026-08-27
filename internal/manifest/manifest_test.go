@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -252,4 +253,38 @@ version = "1.0.0"
 math = "^1.0"
 Math = "^2.0"
 `, "names one dependency twice")
+}
+
+func TestParseRejectsTooManyDependencies(t *testing.T) {
+	var written strings.Builder
+	written.WriteString("[dependencies]\n")
+	for index := range MaxDependencies + 1 {
+		fmt.Fprintf(&written, "dep%d = \"^1.0\"\n", index)
+	}
+
+	_, err := Parse([]byte(written.String()))
+	if err == nil {
+		t.Fatal("a manifest naming more than MaxDependencies dependencies was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "at most") {
+		t.Errorf("error = %q, want it to name the limit", err)
+	}
+}
+
+func TestParseAcceptsTheDependencyLimit(t *testing.T) {
+	var written strings.Builder
+	written.WriteString("[dependencies]\n")
+	for index := range MaxDependencies {
+		fmt.Fprintf(&written, "dep%d = \"^1.0\"\n", index)
+	}
+
+	parsed, err := Parse([]byte(written.String()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(parsed.Dependencies) != MaxDependencies {
+		t.Errorf("read %d dependencies, want %d", len(parsed.Dependencies), MaxDependencies)
+	}
 }

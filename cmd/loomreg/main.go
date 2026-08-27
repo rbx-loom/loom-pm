@@ -20,19 +20,29 @@ import (
 	"github.com/rbx-loom/loom-pm/internal/db"
 	"github.com/rbx-loom/loom-pm/internal/publish"
 	"github.com/rbx-loom/loom-pm/internal/storage"
+	"github.com/rbx-loom/loom-pm/internal/usage"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	// `loomreg token <login> [name]` mints a credential so a self-hosted registry has a
-	// way to publish its first package before anyone can sign in through the web
-	if len(os.Args) > 1 && os.Args[1] == "token" {
-		if err := issueToken(os.Args[2:]); err != nil {
-			logger.Error("could not issue a token", "error", err)
-			os.Exit(1)
+	// the subcommands bootstrap a self-hosted registry: a credential to publish with, and
+	// a scope to publish into, both of which the serving path only ever reads
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "token":
+			if err := issueToken(os.Args[2:]); err != nil {
+				logger.Error("could not issue a token", "error", err)
+				os.Exit(1)
+			}
+			return
+		case "scope":
+			if err := createScope(os.Args[2:]); err != nil {
+				logger.Error("could not create the scope", "error", err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 
 	if err := run(logger); err != nil {
@@ -92,6 +102,9 @@ func run(logger *slog.Logger) error {
 	blobs := storage.NewFilesystem(settings.blobRoot)
 	limits := publish.DefaultLimits()
 
+	recorder := usage.NewRecorder(store, usageInterval, logger)
+	go recorder.Run(ctx)
+
 	server := &http.Server{
 		Addr: settings.address,
 		Handler: api.New(api.Dependencies{
@@ -100,6 +113,7 @@ func run(logger *slog.Logger) error {
 			Publisher:     publish.NewService(store, blobs, limits),
 			Authenticator: auth.New(store),
 			Yanker:        store,
+			Usage:         recorder,
 			Limits:        limits,
 			Logger:        logger,
 		}),
@@ -107,6 +121,10 @@ func run(logger *slog.Logger) error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       2 * time.Minute,
+
+		// net/http's own default, stated: the registry takes no header worth a megabyte,
+		// and a default that only exists in the standard library is one nobody reviews
+		MaxHeaderBytes: http.DefaultMaxHeaderBytes,
 	}
 
 	failed := make(chan error, 1)
@@ -134,6 +152,11 @@ func run(logger *slog.Logger) error {
 
 	return nil
 }
+
+// usageInterval is how often download and token tallies are written out. Long enough that
+// a busy registry writes to those tables a couple of times a minute, short enough that a
+// crash loses a statistic rather than a day of them.
+const usageInterval = 30 * time.Second
 
 func valueOr(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
@@ -177,4 +200,28 @@ func issueToken(arguments []string) error {
 	// stdout, and once: this is the only time the token exists outside its hash
 	fmt.Println(token)
 	return nil
+}
+
+func createScope(arguments []string) error {
+	if len(arguments) < 2 {
+		return errors.New("usage: loomreg scope <name> <login>")
+	}
+
+	settings, err := configure()
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, settings.databaseURL)
+	if err != nil {
+		return fmt.Errorf("connecting to the database: %w", err)
+	}
+	defer pool.Close()
+
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+
+	return db.NewStore(pool).CreateScope(ctx, arguments[0], arguments[1])
 }

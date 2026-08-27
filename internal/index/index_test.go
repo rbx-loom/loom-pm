@@ -2,6 +2,7 @@ package index
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -270,5 +271,45 @@ func TestBuildRendersEmptyListsAsArrays(t *testing.T) {
 
 	if decode(t, empty)["versions"] == nil {
 		t.Errorf("versions rendered as null in %s", empty.Body)
+	}
+}
+
+func TestCacheHoldsADocumentAgainstItsTimestamp(t *testing.T) {
+	cache := NewCache(4)
+	moment := time.Date(2026, 3, 14, 9, 21, 0, 0, time.UTC)
+	document := Document{Body: []byte("{}"), ETag: `"abc"`}
+
+	if _, ok := cache.Lookup("serio", moment); ok {
+		t.Fatal("an empty cache answered a document")
+	}
+
+	cache.Store("serio", moment, document)
+
+	held, ok := cache.Lookup("serio", moment)
+	if !ok {
+		t.Fatal("the stored document was not answered")
+	}
+	if held.ETag != document.ETag {
+		t.Errorf("ETag = %q, want %q", held.ETag, document.ETag)
+	}
+
+	// the point of the timestamp: a package that has changed must not be served from here
+	if _, ok := cache.Lookup("serio", moment.Add(time.Second)); ok {
+		t.Error("a document was answered for a timestamp it was not built from")
+	}
+}
+
+func TestCacheStaysWithinItsLimit(t *testing.T) {
+	const limit = 8
+
+	cache := NewCache(limit)
+	moment := time.Date(2026, 3, 14, 9, 21, 0, 0, time.UTC)
+
+	for index := range limit * 4 {
+		cache.Store(fmt.Sprintf("package-%d", index), moment, Document{ETag: `"x"`})
+	}
+
+	if held := len(cache.entries); held > limit {
+		t.Errorf("the cache holds %d entries, want at most %d", held, limit)
 	}
 }

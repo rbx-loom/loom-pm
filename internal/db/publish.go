@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -42,8 +43,10 @@ func (s *Store) Record(ctx context.Context, record publish.Record) error {
 
 		for _, dependency := range record.Payload.Manifest.Dependencies {
 			_, err := transaction.Exec(ctx,
-				`INSERT INTO dependencies (version_id, name, requirement, is_dev) VALUES ($1, $2, $3, $4)`,
-				versionID, dependency.Name.String(), dependency.Requirement.String(), dependency.Dev)
+				`INSERT INTO dependencies (version_id, name, normalized, requirement, is_dev)
+				 VALUES ($1, $2, $3, $4, $5)`,
+				versionID, dependency.Name.String(), dependency.Name.Normalized(),
+				dependency.Requirement.String(), dependency.Dev)
 			if err != nil {
 				return fmt.Errorf("db: recording dependency %q: %w", dependency.Name, err)
 			}
@@ -160,7 +163,7 @@ func insertVersion(ctx context.Context, transaction pgx.Tx, packageID int64, rec
 		RETURNING id`,
 		packageID, version.Major, version.Minor, version.Patch,
 		nilIfEmpty(version.Prerelease), nilIfEmpty(version.BuildMetadata),
-		record.Payload.Digest[:], len(record.Payload.Content),
+		record.Payload.Digest[:], record.Payload.Size,
 		nilIfEmpty(published.Edition), nilIfEmpty(published.License),
 		nilIfEmpty(published.Description), nilIfEmpty(published.Repository),
 		string(published.Realm), published.Authors, record.PublisherID,
@@ -183,41 +186,58 @@ func insertVersion(ctx context.Context, transaction pgx.Tx, packageID int64, rec
 
 // Unsatisfiable answers the dependencies no published, unyanked version satisfies.
 //
-// The requirement is measured in Go rather than in SQL because what a requirement accepts
-// is the ported semver's answer, and the two must not drift.
+// Every candidate version is read in one query rather than three per dependency, because a
+// manifest may name MaxDependencies of them and one upload must not become one round trip
+// per name. The requirement itself is still measured in Go: what a requirement accepts is
+// the ported semver's answer, and the two must not drift.
 func (s *Store) Unsatisfiable(ctx context.Context, dependencies []manifest.Dependency) ([]manifest.Dependency, error) {
+	keys := make([]string, len(dependencies))
+	for index, dependency := range dependencies {
+		keys[index] = dependency.Name.Normalized()
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT p.normalized, v.major, v.minor, v.patch, v.prerelease
+		FROM packages p
+		JOIN versions v ON v.package_id = p.id
+		WHERE p.normalized = ANY($1) AND v.yanked_at IS NULL`, keys)
+	if err != nil {
+		return nil, fmt.Errorf("db: reading candidate versions: %w", err)
+	}
+	defer rows.Close()
+
+	published := map[string][]semver.Version{}
+	for rows.Next() {
+		var (
+			normalized          string
+			major, minor, patch int32
+			prerelease          *string
+		)
+
+		if err := rows.Scan(&normalized, &major, &minor, &patch, &prerelease); err != nil {
+			return nil, fmt.Errorf("db: reading a candidate version: %w", err)
+		}
+
+		published[normalized] = append(published[normalized], semver.Version{
+			Major:      int(major),
+			Minor:      int(minor),
+			Patch:      int(patch),
+			Prerelease: valueOf(prerelease),
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: reading candidate versions: %w", err)
+	}
+
 	var missing []manifest.Dependency
-
 	for _, dependency := range dependencies {
-		id, _, err := s.locate(ctx, dependency.Name)
-		if errors.Is(err, index.ErrNotFound) {
-			missing = append(missing, dependency)
-			continue
-		} else if err != nil {
-			return nil, err
-		}
-
-		versions, err := s.versionsOf(ctx, id, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		if !anySatisfies(versions, dependency.Requirement) {
+		if !slices.ContainsFunc(published[dependency.Name.Normalized()], dependency.Requirement.Satisfies) {
 			missing = append(missing, dependency)
 		}
 	}
 
 	return missing, nil
-}
-
-func anySatisfies(versions []index.Version, requirement semver.Requirement) bool {
-	for _, version := range versions {
-		if !version.Yanked && requirement.Satisfies(version.Version) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // Yank sets or clears a version's yanked mark.
@@ -265,7 +285,10 @@ func (s *Store) Yank(ctx context.Context, name pkgname.Name, version semver.Vers
 			return fmt.Errorf("%s %s: %w", name, version, index.ErrNotFound)
 		}
 
-		return nil
+		// a yank changes what the index document says, so it changes when the package was
+		// last updated, which is what a cached document is held against
+		_, err = transaction.Exec(ctx, `UPDATE packages SET updated_at = now() WHERE id = $1`, packageID)
+		return err
 	})
 }
 

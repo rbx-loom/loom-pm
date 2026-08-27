@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/rbx-loom/loom-pm/internal/pkgname"
@@ -46,6 +47,10 @@ type Package struct {
 }
 
 type Version struct {
+	// ID is the row this version was read from. It takes no part in the document and
+	// exists so a download can be counted against the version that served it.
+	ID int64
+
 	Version      semver.Version
 	Checksum     storage.Digest
 	Yanked       bool
@@ -68,6 +73,10 @@ type Store interface {
 	// Version answers one published version, or ErrNotFound. Yanked versions are still
 	// answered: a lock file pinning one must keep installing.
 	Version(ctx context.Context, name pkgname.Name, version semver.Version) (Version, error)
+
+	// Modified answers when name last changed, or ErrNotFound, without reading its
+	// versions. It is what lets a revalidation be answered from a Cache.
+	Modified(ctx context.Context, name pkgname.Name) (time.Time, error)
 }
 
 // Document is a rendered index response and the ETag it revalidates with.
@@ -147,4 +156,55 @@ type dependencyDocument struct {
 	Name        string `json:"name"`
 	Requirement string `json:"requirement"`
 	Dev         bool   `json:"dev"`
+}
+
+// Cache holds rendered documents against the moment their package last changed.
+//
+// Revalidation is the common case for an index route, and Build marshals and hashes the
+// whole document: without this, a client asking only whether anything changed pays for the
+// answer it already has. An entry is only ever served for the exact timestamp it was built
+// from, so a stale document cannot be handed out.
+type Cache struct {
+	limit int
+
+	mu      sync.Mutex
+	entries map[string]cached
+}
+
+type cached struct {
+	modified time.Time
+	document Document
+}
+
+func NewCache(limit int) *Cache {
+	return &Cache{limit: max(1, limit), entries: make(map[string]cached, limit)}
+}
+
+// Lookup answers the document built for key at modified, if that is the one held.
+func (c *Cache) Lookup(key string, modified time.Time) (Document, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[key]
+	if !ok || !entry.modified.Equal(modified) {
+		return Document{}, false
+	}
+
+	return entry.document, true
+}
+
+func (c *Cache) Store(key string, modified time.Time, document Document) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// an arbitrary victim rather than the least recently used one: the cache exists to
+	// absorb the popular packages, and those are the ones that get put straight back
+	for len(c.entries) >= c.limit {
+		for victim := range c.entries {
+			delete(c.entries, victim)
+			break
+		}
+	}
+
+	c.entries[key] = cached{modified: modified, document: document}
 }

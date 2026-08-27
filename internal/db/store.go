@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -52,6 +55,24 @@ func (s *Store) Version(ctx context.Context, name pkgname.Name, version semver.V
 	}
 
 	return versions[0], nil
+}
+
+// Modified answers when a package last changed, without reading its versions. It is the
+// query a revalidation costs when the rendered document is already cached.
+func (s *Store) Modified(ctx context.Context, name pkgname.Name) (time.Time, error) {
+	var modified time.Time
+
+	err := s.pool.QueryRow(ctx,
+		`SELECT updated_at FROM packages WHERE normalized = $1`, name.Normalized(),
+	).Scan(&modified)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, fmt.Errorf("%s: %w", name, index.ErrNotFound)
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("db: locating %s: %w", name, err)
+	}
+
+	return modified, nil
 }
 
 // locate answers the row id of a package and the name in the casing it was published
@@ -122,7 +143,6 @@ func (s *Store) versionsOf(ctx context.Context, packageID int64, only *semver.Ve
 	var (
 		versions = []index.Version{}
 		byID     = map[int64]int{}
-		ids      []int64
 	)
 
 	for rows.Next() {
@@ -152,12 +172,12 @@ func (s *Store) versionsOf(ctx context.Context, packageID int64, only *semver.Ve
 			Prerelease:    valueOf(prerelease),
 			BuildMetadata: valueOf(buildMetadata),
 		}
+		version.ID = id
 		version.Checksum = storage.Digest(checksum)
 		version.Realm = index.Realm(realm)
 		version.Dependencies = []index.Dependency{}
 
 		byID[id] = len(versions)
-		ids = append(ids, id)
 		versions = append(versions, version)
 	}
 
@@ -165,16 +185,18 @@ func (s *Store) versionsOf(ctx context.Context, packageID int64, only *semver.Ve
 		return nil, fmt.Errorf("db: reading versions: %w", err)
 	}
 
-	if len(ids) == 0 {
+	if len(versions) == 0 {
 		return versions, nil
 	}
 
-	return versions, s.attachDependencies(ctx, ids, byID, versions)
+	return versions, s.attachDependencies(ctx, byID, versions)
 }
 
-func (s *Store) attachDependencies(ctx context.Context, ids []int64, byID map[int64]int, versions []index.Version) error {
+// attachDependencies fills in the dependencies of the versions byID indexes.
+func (s *Store) attachDependencies(ctx context.Context, byID map[int64]int, versions []index.Version) error {
 	rows, err := s.pool.Query(ctx,
-		`SELECT version_id, name, requirement, is_dev FROM dependencies WHERE version_id = ANY($1)`, ids)
+		`SELECT version_id, name, requirement, is_dev FROM dependencies WHERE version_id = ANY($1)`,
+		slices.Collect(maps.Keys(byID)))
 	if err != nil {
 		return fmt.Errorf("db: reading dependencies: %w", err)
 	}
@@ -201,11 +223,7 @@ func (s *Store) attachDependencies(ctx context.Context, ids []int64, byID map[in
 			return fmt.Errorf("db: %q is stored but is not a version requirement: %w", statement, err)
 		}
 
-		at, ok := byID[versionID]
-		if !ok {
-			continue
-		}
-
+		at := byID[versionID]
 		versions[at].Dependencies = append(versions[at].Dependencies, index.Dependency{
 			Name:        parsed,
 			Requirement: requirement,

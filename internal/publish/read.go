@@ -27,7 +27,12 @@ type Limits struct {
 	CompressedBytes   int64
 	DecompressedBytes int64
 	FileBytes         int64
-	Files             int
+
+	// ManifestBytes bounds loom-config.toml on its own. FileBytes is sized for source a
+	// package ships; a manifest that large is a generated file rather than an identity.
+	ManifestBytes int64
+
+	Files int
 }
 
 func DefaultLimits() Limits {
@@ -35,8 +40,16 @@ func DefaultLimits() Limits {
 		CompressedBytes:   5 << 20,
 		DecompressedBytes: 25 << 20,
 		FileBytes:         5 << 20,
+		ManifestBytes:     64 << 10,
 		Files:             2000,
 	}
+}
+
+// Valid reports whether every bound is set. A partially filled Limits is a configuration
+// mistake, not a request to default the rest.
+func (l Limits) Valid() bool {
+	return l.CompressedBytes > 0 && l.DecompressedBytes > 0 &&
+		l.FileBytes > 0 && l.ManifestBytes > 0 && l.Files > 0
 }
 
 // Payload is an upload that has been read and found structurally sound. Whether it may be
@@ -44,7 +57,7 @@ func DefaultLimits() Limits {
 type Payload struct {
 	Manifest manifest.Manifest
 	Files    []string
-	Content  []byte
+	Size     int64
 	Digest   storage.Digest
 }
 
@@ -116,7 +129,12 @@ func Read(content []byte, limits Limits) (Payload, error) {
 		}
 
 		if name == manifest.FileName {
-			manifested, err = io.ReadAll(io.LimitReader(archive, limits.FileBytes+1))
+			if header.Size > limits.ManifestBytes {
+				return Payload{}, fmt.Errorf("%s is %d bytes, and at most %d may describe a package",
+					manifest.FileName, header.Size, limits.ManifestBytes)
+			}
+
+			manifested, err = io.ReadAll(io.LimitReader(archive, limits.ManifestBytes+1))
 			if err != nil {
 				return Payload{}, fmt.Errorf("reading %s: %w", manifest.FileName, err)
 			}
@@ -147,7 +165,7 @@ func Read(content []byte, limits Limits) (Payload, error) {
 	return Payload{
 		Manifest: read,
 		Files:    files,
-		Content:  content,
+		Size:     int64(len(content)),
 		Digest:   storage.DigestOf(content),
 	}, nil
 }

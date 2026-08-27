@@ -56,7 +56,15 @@ func (d Digest) Hex() string {
 
 // Blobs stores package tarballs. Put is content-addressed and therefore idempotent:
 // storing the same bytes twice is a no-op, which is what lets a failed publish be retried.
+//
+// There is no Delete: a blob a publish wrote before failing is never referenced and never
+// removed. Put takes the whole tarball in memory, which CompressedBytes is what makes
+// tolerable; an object-store backend would want a reader and a size instead.
 type Blobs interface {
 	Put(ctx context.Context, content []byte) (Digest, error)
+
+	// Open answers the blob's contents and its length. The reader also implements
+	// io.ReadSeeker whenever the backend can seek, which is what lets a download serve a
+	// Range; a backend that cannot must still answer a working ReadCloser.
 	Open(ctx context.Context, digest Digest) (io.ReadCloser, int64, error)
 }

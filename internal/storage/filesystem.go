@@ -61,6 +61,19 @@ func (f *Filesystem) Put(_ context.Context, content []byte) (Digest, error) {
 		return Digest{}, fmt.Errorf("storage: publishing %s: %w", digest, err)
 	}
 
+	// the rename is not durable until the directory entry is: a crash here would leave a
+	// version row pointing at a blob that never arrived, which is the state the
+	// write-then-rename was chosen to avoid
+	handle, err := os.Open(directory)
+	if err != nil {
+		return Digest{}, fmt.Errorf("storage: opening %s to flush it: %w", directory, err)
+	}
+	defer handle.Close()
+
+	if err := handle.Sync(); err != nil {
+		return Digest{}, fmt.Errorf("storage: flushing %s: %w", directory, err)
+	}
+
 	return digest, nil
 }
 

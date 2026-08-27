@@ -25,6 +25,7 @@ import (
 
 type fakeStore struct {
 	packages map[string]index.Package
+	modified time.Time
 	err      error
 }
 
@@ -39,6 +40,14 @@ func (f fakeStore) Package(_ context.Context, name pkgname.Name) (index.Package,
 	}
 
 	return pkg, nil
+}
+
+func (f fakeStore) Modified(ctx context.Context, name pkgname.Name) (time.Time, error) {
+	if _, err := f.Package(ctx, name); err != nil {
+		return time.Time{}, err
+	}
+
+	return f.modified, nil
 }
 
 func (f fakeStore) Version(ctx context.Context, name pkgname.Name, version semver.Version) (index.Version, error) {
@@ -177,7 +186,7 @@ func storeWith(t *testing.T, names ...string) fakeStore {
 		}
 	}
 
-	return fakeStore{packages: packages}
+	return fakeStore{packages: packages, modified: time.Date(2026, 3, 14, 9, 21, 0, 0, time.UTC)}
 }
 
 func get(t *testing.T, handler http.Handler, target string, header http.Header) *httptest.ResponseRecorder {

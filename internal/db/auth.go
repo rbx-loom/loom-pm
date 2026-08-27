@@ -11,6 +11,9 @@ import (
 
 // UserByTokenHash answers the owner of a live token. Revoked tokens are not live, and the
 // lookup is by hash because the token itself is never stored.
+//
+// It writes nothing: last_used_at is recorded away from the request, in usage.Recorder, so
+// that reading a token does not cost a write on every authenticated call.
 func (s *Store) UserByTokenHash(ctx context.Context, hash []byte) (auth.User, error) {
 	var user auth.User
 
@@ -27,9 +30,6 @@ func (s *Store) UserByTokenHash(ctx context.Context, hash []byte) (auth.User, er
 	} else if err != nil {
 		return auth.User{}, fmt.Errorf("db: resolving a token: %w", err)
 	}
-
-	// best effort: a failed timestamp is not a reason to refuse a valid token
-	s.pool.Exec(ctx, `UPDATE tokens SET last_used_at = now() WHERE hash = $1`, hash)
 
 	return user, nil
 }

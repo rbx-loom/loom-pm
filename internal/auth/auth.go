@@ -25,6 +25,10 @@ var ErrUnauthenticated = errors.New("auth: no such token")
 type User struct {
 	ID    int64
 	Login string
+
+	// TokenHash is the token this user was resolved from, so that its use can be recorded
+	// away from the request rather than written on every authenticated call.
+	TokenHash []byte
 }
 
 // NewToken answers the token to show its owner once, and the hash to store.
@@ -56,7 +60,8 @@ func BearerToken(header string) (string, bool) {
 
 type Store interface {
 	// UserByTokenHash answers the owner of a live token, or ErrUnauthenticated. A revoked
-	// or expired token is not a live one.
+	// token is not a live one. Tokens do not expire: nothing in the schema records when
+	// one would, and a lifetime nobody enforces is worse than none at all.
 	UserByTokenHash(ctx context.Context, hash []byte) (User, error)
 }
 
@@ -79,5 +84,12 @@ func (a *Authenticator) Authenticate(ctx context.Context, header string) (User, 
 		return User{}, fmt.Errorf("the request carries no bearer token: %w", ErrUnauthenticated)
 	}
 
-	return a.store.UserByTokenHash(ctx, HashToken(presented))
+	hash := HashToken(presented)
+	user, err := a.store.UserByTokenHash(ctx, hash)
+	if err != nil {
+		return User{}, err
+	}
+
+	user.TokenHash = hash
+	return user, nil
 }

@@ -332,3 +332,35 @@ func TestReadRejectsMalformedArchives(t *testing.T) {
 	rejects(t, compressed.Bytes(), "is not a tar")
 	rejects(t, nil, "is empty")
 }
+
+// The manifest is bounded on its own, well under FileBytes: nothing legitimate needs
+// megabytes to say what a package is called.
+func TestReadRejectsAnOversizedManifest(t *testing.T) {
+	limits := DefaultLimits()
+	limits.ManifestBytes = 16
+
+	_, err := Read(valid(t), limits)
+	if err == nil {
+		t.Fatal("a manifest over ManifestBytes was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "describe a package") {
+		t.Errorf("error = %q, want it to name the manifest limit", err)
+	}
+}
+
+func TestLimitsAreValidOnlyWhenComplete(t *testing.T) {
+	if !DefaultLimits().Valid() {
+		t.Error("DefaultLimits is not valid")
+	}
+
+	if (Limits{}).Valid() {
+		t.Error("a zero Limits reports itself as valid")
+	}
+
+	partial := DefaultLimits()
+	partial.ManifestBytes = 0
+	if partial.Valid() {
+		t.Error("a Limits missing one bound reports itself as valid")
+	}
+}

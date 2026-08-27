@@ -79,6 +79,7 @@
     { "text": ">=1.0.0, <=1.0.0", "valid": true, "note": "equal bounds, both inclusive, accepts exactly one version" },
     { "text": "^1.2.3-alpha", "valid": true },
     { "text": "  ^1.2  ", "valid": true, "note": "a requirement is trimmed, and so is each clause" },
+    { "text": ">=2147483647.0.0", "valid": true, "note": "a comparator deriving no ceiling may name the largest component" },
 
     { "text": ">=2, <1", "valid": false, "note": "unsatisfiable is a parse error, never an empty interval" },
     { "text": ">1.0.0, <1.0.0", "valid": false },
@@ -86,7 +87,13 @@
     { "text": "", "valid": false },
     { "text": ",", "valid": false, "note": "empty clause" },
     { "text": "1.2.3+build", "valid": false, "note": "build metadata takes no part in comparison, so a requirement may not name it" },
-    { "text": "1.2.3.4", "valid": false, "note": "at most three components" }
+    { "text": "1.2.3.4", "valid": false, "note": "at most three components" },
+    { "text": "^2147483647", "valid": false, "note": "the caret ceiling would overflow the major, and no version the client can parse names it" },
+    { "text": "^0.2147483647", "valid": false, "note": "a zero major moves the ceiling onto the minor, which overflows the same way" },
+    { "text": "^0.0.2147483647", "valid": false, "note": "a zero major and minor move the ceiling onto the patch" },
+    { "text": "~1.2147483647", "valid": false, "note": "the tilde ceiling would overflow the minor" },
+    { "text": ">>1.0", "valid": false, "note": "a doubled comparator is not a version" },
+    { "text": "=<1.0", "valid": false, "note": "'=<' is not a comparator, so the clause does not begin with a version" }
   ],
 
   "satisfies": [

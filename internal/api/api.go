@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rbx-loom/loom-pm/internal/auth"
 	"github.com/rbx-loom/loom-pm/internal/index"
@@ -30,6 +31,15 @@ const (
 
 	// a published version is never replaced
 	downloadCacheControl = "public, max-age=31536000, immutable"
+
+	// enough to hold the packages a busy registry revalidates, and small enough that the
+	// documents themselves are not the thing that exhausts memory
+	documentCacheSize = 2048
+
+	// one publish a minute sustained, ten at once. A release train pushing a handful of
+	// packages never notices; a loop filling the blob store does.
+	publishEvery = time.Minute
+	publishBurst = 10
 )
 
 // Yanker sets and clears a version's yanked mark. A yanked version stays downloadable, so
@@ -39,28 +49,59 @@ type Yanker interface {
 	Yank(ctx context.Context, name pkgname.Name, version semver.Version, yanked bool, userID int64) error
 }
 
+// Usage counts what the registry served. Both calls are fire-and-forget: a download is
+// served whether or not anybody is counting it.
+type Usage interface {
+	Download(versionID int64)
+	TokenUsed(hash []byte)
+}
+
 type Dependencies struct {
 	Store         index.Store
 	Blobs         storage.Blobs
 	Publisher     *publish.Service
 	Authenticator *auth.Authenticator
 	Yanker        Yanker
+	Usage         Usage
 	Limits        publish.Limits
 	Logger        *slog.Logger
 }
 
 type API struct {
 	Dependencies
+
+	documents *index.Cache
+	publishes *limiter
 }
 
+// New builds the handler.
+//
+// A missing logger or usage recorder is defaulted, because serving without either is still
+// serving. A partially configured Limits panics instead: an unset bound is a zero one, and
+// a registry that rejects every upload has failed in a way nothing downstream can report.
 func New(dependencies Dependencies) http.Handler {
 	if dependencies.Limits == (publish.Limits{}) {
 		dependencies.Limits = publish.DefaultLimits()
 	}
+	if !dependencies.Limits.Valid() {
+		panic("api: Limits is partially configured; set every bound or none")
+	}
+	if dependencies.Logger == nil {
+		dependencies.Logger = slog.New(slog.DiscardHandler)
+	}
+	if dependencies.Usage == nil {
+		dependencies.Usage = discardUsage{}
+	}
 
-	api := &API{Dependencies: dependencies}
+	api := &API{
+		Dependencies: dependencies,
+		documents:    index.NewCache(documentCacheSize),
+		publishes:    newLimiter(publishEvery, publishBurst),
+	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", api.serveHealth)
+
 	mux.HandleFunc("GET /v1/index/{name}", api.serveIndex)
 	mux.HandleFunc("GET /v1/index/{scope}/{name}", api.serveIndex)
 	mux.HandleFunc("GET /v1/packages/{name}/{version}/download", api.serveDownload)
@@ -77,30 +118,55 @@ func New(dependencies Dependencies) http.Handler {
 	// instead of being swallowed here as a 404
 	mux.HandleFunc("GET /", api.serveUnknown)
 
-	return mux
+	return observed(mux, dependencies.Logger)
+}
+
+// serveHealth answers whether the process is running, and deliberately touches nothing
+// else: a liveness check that fails when the database does gets the container restarted
+// for someone else's outage.
+func (a *API) serveHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte("ok\n"))
 }
 
 func (a *API) serveIndex(w http.ResponseWriter, r *http.Request) {
 	name, err := nameFrom(r)
 	if err != nil {
-		a.fail(w, http.StatusBadRequest, err.Error())
+		a.fail(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	pkg, err := a.Store.Package(r.Context(), name)
+	// asked first, and on its own: revalidation is the common case here, and rebuilding a
+	// document to answer "no, nothing changed" is the whole cost of the request
+	modified, err := a.Store.Modified(r.Context(), name)
 	switch {
 	case errors.Is(err, index.ErrNotFound):
-		a.fail(w, http.StatusNotFound, fmt.Sprintf("'%s' is not published here.", name))
+		a.fail(w, r, http.StatusNotFound, fmt.Sprintf("'%s' is not published here.", name))
 		return
 	case err != nil:
 		a.internal(w, r, "read the index", err)
 		return
 	}
 
-	document, err := index.Build(pkg)
-	if err != nil {
-		a.internal(w, r, "render the index", err)
-		return
+	document, cached := a.documents.Lookup(name.Normalized(), modified)
+	if !cached {
+		pkg, err := a.Store.Package(r.Context(), name)
+		switch {
+		case errors.Is(err, index.ErrNotFound):
+			a.fail(w, r, http.StatusNotFound, fmt.Sprintf("'%s' is not published here.", name))
+			return
+		case err != nil:
+			a.internal(w, r, "read the index", err)
+			return
+		}
+
+		document, err = index.Build(pkg)
+		if err != nil {
+			a.internal(w, r, "render the index", err)
+			return
+		}
+
+		a.documents.Store(name.Normalized(), modified, document)
 	}
 
 	header := w.Header()
@@ -122,14 +188,14 @@ func (a *API) serveIndex(w http.ResponseWriter, r *http.Request) {
 func (a *API) serveDownload(w http.ResponseWriter, r *http.Request) {
 	name, version, err := versionFrom(r)
 	if err != nil {
-		a.fail(w, http.StatusBadRequest, err.Error())
+		a.fail(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	published, err := a.Store.Version(r.Context(), name, version)
 	switch {
 	case errors.Is(err, index.ErrNotFound):
-		a.fail(w, http.StatusNotFound, fmt.Sprintf("'%s' %s is not published here.", name, version))
+		a.fail(w, r, http.StatusNotFound, fmt.Sprintf("'%s' %s is not published here.", name, version))
 		return
 	case err != nil:
 		a.internal(w, r, "read the index", err)
@@ -147,14 +213,30 @@ func (a *API) serveDownload(w http.ResponseWriter, r *http.Request) {
 
 	header := w.Header()
 	header.Set("Content-Type", "application/gzip")
-	header.Set("Content-Length", strconv.FormatInt(size, 10))
 	header.Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", downloadName(name, version)))
 	header.Set("ETag", `"`+published.Checksum.Hex()+`"`)
 	header.Set("Cache-Control", downloadCacheControl)
 
-	if _, err := io.Copy(w, content); err != nil {
-		a.Logger.WarnContext(r.Context(), "writing a package", "error", err, "package", name.String(), "version", version.String())
+	// a ranged request is a download being resumed rather than started, and counting it
+	// again would make a flaky connection look like a popular package
+	if r.Header.Get("Range") == "" {
+		a.Usage.Download(published.ID)
 	}
+
+	seeker, ok := content.(io.ReadSeeker)
+	if !ok {
+		// a backend that cannot seek gets the plain copy, and the client gets no Range
+		header.Set("Content-Length", strconv.FormatInt(size, 10))
+		if _, err := io.Copy(w, content); err != nil {
+			a.Logger.WarnContext(r.Context(), "writing a package", "error", err,
+				"package", name.String(), "version", version.String())
+		}
+		return
+	}
+
+	// ServeContent honours Range and revalidates against the ETag set above, so a download
+	// that dies halfway resumes rather than starting over with a length it cannot meet
+	http.ServeContent(w, r, downloadName(name, version), published.PublishedAt, seeker)
 }
 
 func (a *API) servePublish(w http.ResponseWriter, r *http.Request) {
@@ -163,17 +245,24 @@ func (a *API) servePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if wait, allowed := a.publishes.allow(publisher.ID, time.Now()); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Round(time.Second)/time.Second)))
+		a.fail(w, r, http.StatusTooManyRequests,
+			fmt.Sprintf("this token is publishing too often; try again in %s.", wait.Round(time.Second)))
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, a.Limits.CompressedBytes)
 	content, err := io.ReadAll(r.Body)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			a.fail(w, http.StatusRequestEntityTooLarge,
+			a.fail(w, r, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("at most %d bytes may be published at once.", a.Limits.CompressedBytes))
 			return
 		}
 
-		a.fail(w, http.StatusBadRequest, "the upload could not be read.")
+		a.fail(w, r, http.StatusBadRequest, "the upload could not be read.")
 		return
 	}
 
@@ -196,11 +285,11 @@ func (a *API) reportPublishFailure(w http.ResponseWriter, r *http.Request, err e
 
 	switch {
 	case errors.As(err, &invalid):
-		a.fail(w, http.StatusBadRequest, invalid.Error())
+		a.fail(w, r, http.StatusBadRequest, invalid.Error())
 	case errors.Is(err, publish.ErrAlreadyPublished), errors.Is(err, publish.ErrSquatted):
-		a.fail(w, http.StatusConflict, err.Error())
+		a.fail(w, r, http.StatusConflict, err.Error())
 	case errors.Is(err, publish.ErrNotOwned), errors.Is(err, publish.ErrNotScopeMember):
-		a.fail(w, http.StatusForbidden, err.Error())
+		a.fail(w, r, http.StatusForbidden, err.Error())
 	default:
 		a.internal(w, r, "publish this version", err)
 	}
@@ -215,15 +304,15 @@ func (a *API) serveYank(yanked bool) http.HandlerFunc {
 
 		name, version, err := versionFrom(r)
 		if err != nil {
-			a.fail(w, http.StatusBadRequest, err.Error())
+			a.fail(w, r, http.StatusBadRequest, err.Error())
 			return
 		}
 
 		switch err := a.Yanker.Yank(r.Context(), name, version, yanked, user.ID); {
 		case errors.Is(err, index.ErrNotFound):
-			a.fail(w, http.StatusNotFound, fmt.Sprintf("'%s' %s is not published here.", name, version))
+			a.fail(w, r, http.StatusNotFound, fmt.Sprintf("'%s' %s is not published here.", name, version))
 		case errors.Is(err, publish.ErrNotOwned):
-			a.fail(w, http.StatusForbidden, err.Error())
+			a.fail(w, r, http.StatusForbidden, err.Error())
 		case err != nil:
 			a.internal(w, r, "change this version", err)
 		default:
@@ -237,7 +326,7 @@ func (a *API) serveYank(yanked bool) http.HandlerFunc {
 }
 
 func (a *API) serveUnknown(w http.ResponseWriter, r *http.Request) {
-	a.fail(w, http.StatusNotFound, fmt.Sprintf("'%s' is not an endpoint of this registry.", r.URL.Path))
+	a.fail(w, r, http.StatusNotFound, fmt.Sprintf("'%s' is not an endpoint of this registry.", r.URL.Path))
 }
 
 func (a *API) authenticate(w http.ResponseWriter, r *http.Request) (auth.User, bool) {
@@ -245,12 +334,14 @@ func (a *API) authenticate(w http.ResponseWriter, r *http.Request) (auth.User, b
 	switch {
 	case errors.Is(err, auth.ErrUnauthenticated):
 		w.Header().Set("WWW-Authenticate", `Bearer realm="loom"`)
-		a.fail(w, http.StatusUnauthorized, "this needs a valid API token; run 'loom login' to get one.")
+		a.fail(w, r, http.StatusUnauthorized, "this needs a valid API token; run 'loom login' to get one.")
 		return auth.User{}, false
 	case err != nil:
 		a.internal(w, r, "check your token", err)
 		return auth.User{}, false
 	}
+
+	a.Usage.TokenUsed(user.TokenHash)
 
 	return user, true
 }
@@ -296,6 +387,9 @@ func matches(header, etag string) bool {
 
 type errorEnvelope struct {
 	Errors []errorDetail `json:"errors"`
+
+	// the id the same failure was logged under, so a report of one can be found
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type errorDetail struct {
@@ -315,8 +409,11 @@ func (a *API) render(w http.ResponseWriter, status int, value any) {
 	w.Write(body)
 }
 
-func (a *API) fail(w http.ResponseWriter, status int, details ...string) {
-	envelope := errorEnvelope{Errors: make([]errorDetail, 0, len(details))}
+func (a *API) fail(w http.ResponseWriter, r *http.Request, status int, details ...string) {
+	envelope := errorEnvelope{
+		Errors:    make([]errorDetail, 0, len(details)),
+		RequestID: requestIDOf(r.Context()),
+	}
 	for _, detail := range details {
 		envelope.Errors = append(envelope.Errors, errorDetail{Detail: detail})
 	}
@@ -325,8 +422,15 @@ func (a *API) fail(w http.ResponseWriter, status int, details ...string) {
 }
 
 // internal logs the cause and tells the client only what could not be done: an internal
-// failure is not the caller's to read.
+// failure is not the caller's to read. The request id is on both, which is what connects
+// the report to the log line.
 func (a *API) internal(w http.ResponseWriter, r *http.Request, what string, err error) {
-	a.Logger.ErrorContext(r.Context(), "serving a request", "error", err, "method", r.Method, "path", r.URL.Path)
-	a.fail(w, http.StatusInternalServerError, "the registry could not "+what+" just now; try again shortly.")
+	a.Logger.ErrorContext(r.Context(), "serving a request", "error", err,
+		"method", r.Method, "path", r.URL.Path, "request", requestIDOf(r.Context()))
+	a.fail(w, r, http.StatusInternalServerError, "the registry could not "+what+" just now; try again shortly.")
 }
+
+type discardUsage struct{}
+
+func (discardUsage) Download(int64)   {}
+func (discardUsage) TokenUsed([]byte) {}

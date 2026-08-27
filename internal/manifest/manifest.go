@@ -15,6 +15,11 @@ import (
 
 const FileName = "loom-config.toml"
 
+// MaxDependencies bounds what one version may declare. Every dependency costs the registry
+// a resolvability check at publish time, so an unbounded list turns one small upload into
+// as much database work as the author cares to ask for.
+const MaxDependencies = 256
+
 type Manifest struct {
 	// Package is nil for a project that is never published, such as a game.
 	Package      *Package
@@ -101,6 +106,11 @@ func Parse(content []byte) (Manifest, error) {
 }
 
 func readDependencies(entries map[string]any) ([]Dependency, error) {
+	if len(entries) > MaxDependencies {
+		return nil, fmt.Errorf("[dependencies] names %d packages, and at most %d may be declared",
+			len(entries), MaxDependencies)
+	}
+
 	dependencies := make([]Dependency, 0, len(entries))
 	seen := make(map[string]string, len(entries))
 

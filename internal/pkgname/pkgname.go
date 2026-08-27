@@ -47,6 +47,12 @@ func Parse(text string) (Name, error) {
 	return Name{scope: scope, name: name}, nil
 }
 
+// ValidateScope checks a scope on its own, for the places one is named without a package
+// after it.
+func ValidateScope(text string) error {
+	return validateSegment(strings.TrimSpace(text), "scope")
+}
+
 func (n Name) Scope() string { return n.scope }
 func (n Name) Name() string  { return n.name }
 

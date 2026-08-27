@@ -34,7 +34,9 @@ CREATE TABLE scope_members (
 
 CREATE TABLE packages (
     id         BIGSERIAL PRIMARY KEY,
-    scope_id   BIGINT REFERENCES scopes (id),
+    -- RESTRICT, and stated: a scope with packages under it is not one anybody may drop,
+    -- and the default is worth reading in the schema rather than in the manual
+    scope_id   BIGINT REFERENCES scopes (id) ON DELETE RESTRICT,
 
     -- name is the segment after the scope, in the casing it was published under; the
     -- display form is scopes.name || '/' || packages.name
@@ -91,10 +93,18 @@ CREATE INDEX versions_package ON versions (package_id);
 
 CREATE TABLE dependencies (
     version_id  BIGINT NOT NULL REFERENCES versions (id) ON DELETE CASCADE,
+
+    -- name is the casing the manifest declared, which is what the index document renders
     name        TEXT NOT NULL,
+
+    -- the same lowercased, and the half of the key that matters: names are compared
+    -- case-insensitively, so this is what makes two spellings of one dependency collide
+    -- here as well as in the manifest reader
+    normalized  TEXT NOT NULL,
+
     requirement TEXT NOT NULL,
     is_dev      BOOLEAN NOT NULL DEFAULT false,
-    PRIMARY KEY (version_id, name)
+    PRIMARY KEY (version_id, normalized)
 );
 
 CREATE TABLE downloads (

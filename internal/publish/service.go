@@ -59,8 +59,9 @@ func (s *Service) Publish(ctx context.Context, content []byte, publisherID int64
 		return Payload{}, err
 	}
 
-	// before the row, so a failure between the two leaves a blob to sweep rather than a
-	// version nobody can install
+	// before the row, so a failure between the two leaves an unreferenced blob rather than
+	// a version nobody can install. Nothing sweeps those: they are permanent, and bounded
+	// by CompressedBytes per failed publish, which is the cheaper of the two leaks.
 	if _, err := s.blobs.Put(ctx, content); err != nil {
 		return Payload{}, err
 	}
