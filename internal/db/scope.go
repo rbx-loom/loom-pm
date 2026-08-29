@@ -8,11 +8,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/rbx-loom/loom-pm/internal/auth"
 	"github.com/rbx-loom/loom-pm/internal/pkgname"
 )
 
-// ErrNoSuchUser is answered when a scope names an owner who has never been seen.
-var ErrNoSuchUser = errors.New("db: no such user")
+// ErrNoSuchUser is answered when a scope names an owner who has never been seen. It is
+// auth's sentinel so that the serving path can recognise it without importing this package.
+var ErrNoSuchUser = auth.ErrNoSuchUser
 
 // CreateScope registers a scope and makes login its owner.
 //

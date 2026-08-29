@@ -84,6 +84,12 @@ func Parse(content []byte) (Manifest, error) {
 			}
 		}
 
+		// never nil: authors reaches a TEXT[] NOT NULL column, where a nil slice is NULL
+		authors := raw.Package.Authors
+		if authors == nil {
+			authors = []string{}
+		}
+
 		parsed.Package = &Package{
 			Name:        name,
 			Version:     version,
@@ -91,7 +97,7 @@ func Parse(content []byte) (Manifest, error) {
 			License:     raw.Package.License,
 			Description: raw.Package.Description,
 			Repository:  raw.Package.Repository,
-			Authors:     raw.Package.Authors,
+			Authors:     authors,
 			Realm:       realm,
 		}
 	}

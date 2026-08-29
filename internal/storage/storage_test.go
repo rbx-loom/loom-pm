@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDigestRoundTrip(t *testing.T) {
@@ -165,5 +166,138 @@ func TestFilesystemLeavesNoTemporaries(t *testing.T) {
 
 	if found != 1 {
 		t.Errorf("store holds %d files, want exactly the blob", found)
+	}
+}
+
+func TestFilesystemWalk(t *testing.T) {
+	blobs := NewFilesystem(t.TempDir())
+	ctx := context.Background()
+
+	want := map[Digest]bool{}
+	for _, content := range []string{"one", "two", "three"} {
+		digest, err := blobs.Put(ctx, []byte(content))
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		want[digest] = true
+	}
+
+	seen := map[Digest]bool{}
+	err := blobs.Walk(ctx, func(digest Digest, size int64, modified time.Time) error {
+		if size == 0 {
+			t.Errorf("%s was walked with no size", digest)
+		}
+		if modified.IsZero() {
+			t.Errorf("%s was walked with no modification time", digest)
+		}
+		seen[digest] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+
+	if len(seen) != len(want) {
+		t.Fatalf("walked %d blobs, want %d", len(seen), len(want))
+	}
+
+	for digest := range want {
+		if !seen[digest] {
+			t.Errorf("%s was not walked", digest)
+		}
+	}
+}
+
+func TestFilesystemWalkIsEmptyForAnEmptyStore(t *testing.T) {
+	blobs := NewFilesystem(t.TempDir())
+
+	err := blobs.Walk(context.Background(), func(Digest, int64, time.Time) error {
+		t.Error("an empty store walked a blob")
+		return nil
+	})
+	if err != nil {
+		t.Errorf("Walk of an empty store: %v", err)
+	}
+}
+
+// A file whose name is not a digest is not a blob. Walking must not report one, because
+// the sweeper would then delete something it never wrote.
+func TestFilesystemWalkIgnoresStrays(t *testing.T) {
+	root := t.TempDir()
+	blobs := NewFilesystem(root)
+
+	if _, err := blobs.Put(context.Background(), []byte("real")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	stray := filepath.Join(root, "ab", "cd")
+	if err := os.MkdirAll(stray, 0o755); err != nil {
+		t.Fatalf("making a stray directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stray, "not-a-digest"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("writing a stray: %v", err)
+	}
+
+	var walked int
+	err := blobs.Walk(context.Background(), func(Digest, int64, time.Time) error {
+		walked++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+
+	if walked != 1 {
+		t.Errorf("walked %d blobs, want only the real one", walked)
+	}
+}
+
+func TestFilesystemWalkStops(t *testing.T) {
+	blobs := NewFilesystem(t.TempDir())
+	ctx := context.Background()
+
+	for _, content := range []string{"one", "two", "three"} {
+		if _, err := blobs.Put(ctx, []byte(content)); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	stop := errors.New("enough")
+	var walked int
+
+	err := blobs.Walk(ctx, func(Digest, int64, time.Time) error {
+		walked++
+		return stop
+	})
+
+	if !errors.Is(err, stop) {
+		t.Errorf("Walk = %v, want the callback's error", err)
+	}
+
+	if walked != 1 {
+		t.Errorf("walked %d blobs after the callback stopped, want 1", walked)
+	}
+}
+
+func TestFilesystemDelete(t *testing.T) {
+	blobs := NewFilesystem(t.TempDir())
+	ctx := context.Background()
+
+	digest, err := blobs.Put(ctx, []byte("removable"))
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := blobs.Delete(ctx, digest); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if _, _, err := blobs.Open(ctx, digest); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Open after Delete = %v, want ErrNotFound", err)
+	}
+
+	// deleting what is already gone is the state the caller asked for
+	if err := blobs.Delete(ctx, digest); err != nil {
+		t.Errorf("Delete of a missing blob: %v", err)
 	}
 }

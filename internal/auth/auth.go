@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // TokenPrefix marks a Loom token so that secret scanners can recognise one that has been
@@ -92,4 +93,23 @@ func (a *Authenticator) Authenticate(ctx context.Context, header string) (User, 
 
 	user.TokenHash = hash
 	return user, nil
+}
+
+var (
+	// ErrNoSuchUser is answered when something names a login the registry has never seen.
+	ErrNoSuchUser = errors.New("auth: no such user")
+
+	// ErrNoSuchToken is answered when a token is revoked that is not the caller's, which
+	// is the same answer as one that does not exist: whose token it is, is not something
+	// to confirm to somebody who does not hold it.
+	ErrNoSuchToken = errors.New("auth: no such token")
+)
+
+// TokenSummary is what a token listing may say about a token: enough to recognise one and
+// revoke it, and never the secret, which exists outside its hash exactly once.
+type TokenSummary struct {
+	ID         int64
+	Name       string
+	CreatedAt  time.Time
+	LastUsedAt time.Time
 }

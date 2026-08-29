@@ -108,7 +108,8 @@ func seed(t *testing.T, pool *pgxpool.Pool, name string, versions ...string) {
 		}
 
 		_, err = pool.Exec(ctx,
-			`INSERT INTO dependencies (version_id, name, requirement, is_dev) VALUES ($1, 'math', '^1.0', false)`,
+			`INSERT INTO dependencies (version_id, name, normalized, requirement, is_dev)
+			 VALUES ($1, 'math', 'math', '^1.0', false)`,
 			versionID)
 		if err != nil {
 			t.Fatalf("seeding a dependency: %v", err)

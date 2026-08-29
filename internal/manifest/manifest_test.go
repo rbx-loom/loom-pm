@@ -288,3 +288,21 @@ func TestParseAcceptsTheDependencyLimit(t *testing.T) {
 		t.Errorf("read %d dependencies, want %d", len(parsed.Dependencies), MaxDependencies)
 	}
 }
+
+// Authors reaches a TEXT[] NOT NULL column, where a nil slice is NULL and a manifest
+// naming no authors would be unpublishable.
+func TestParseAlwaysGivesAuthors(t *testing.T) {
+	parsed := parse(t, `
+[package]
+name = "serio"
+version = "1.0.0"
+`)
+
+	if parsed.Package.Authors == nil {
+		t.Error("authors is nil for a manifest that names none, want an empty list")
+	}
+
+	if len(parsed.Package.Authors) != 0 {
+		t.Errorf("authors = %v, want none", parsed.Package.Authors)
+	}
+}

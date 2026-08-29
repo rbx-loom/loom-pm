@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/rbx-loom/loom-pm/internal/auth"
+	"github.com/rbx-loom/loom-pm/internal/catalog"
 	"github.com/rbx-loom/loom-pm/internal/index"
 	"github.com/rbx-loom/loom-pm/internal/pkgname"
 	"github.com/rbx-loom/loom-pm/internal/publish"
@@ -62,9 +63,19 @@ type Dependencies struct {
 	Publisher     *publish.Service
 	Authenticator *auth.Authenticator
 	Yanker        Yanker
+	Owners        Owners
+	Tokens        Tokens
+	Provider      auth.Provider
+	Users         Users
+	Catalog       catalog.Store
 	Usage         Usage
 	Limits        publish.Limits
-	Logger        *slog.Logger
+
+	// MetricsToken guards /metrics when set. Unset, the endpoint is open: it carries no
+	// package names and no secrets, only how much of each kind of request was served.
+	MetricsToken string
+
+	Logger *slog.Logger
 }
 
 type API struct {
@@ -72,6 +83,7 @@ type API struct {
 
 	documents *index.Cache
 	publishes *limiter
+	metrics   *metrics
 }
 
 // New builds the handler.
@@ -97,10 +109,12 @@ func New(dependencies Dependencies) http.Handler {
 		Dependencies: dependencies,
 		documents:    index.NewCache(documentCacheSize),
 		publishes:    newLimiter(publishEvery, publishBurst),
+		metrics:      newMetrics(),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", api.serveHealth)
+	mux.HandleFunc("GET /metrics", api.serveMetrics)
 
 	mux.HandleFunc("GET /v1/index/{name}", api.serveIndex)
 	mux.HandleFunc("GET /v1/index/{scope}/{name}", api.serveIndex)
@@ -114,11 +128,29 @@ func New(dependencies Dependencies) http.Handler {
 	mux.HandleFunc("DELETE /v1/packages/{name}/{version}/yank", api.serveYank(false))
 	mux.HandleFunc("DELETE /v1/packages/{scope}/{name}/{version}/yank", api.serveYank(false))
 
+	mux.HandleFunc("GET /v1/packages/{name}/owners", api.serveOwners)
+	mux.HandleFunc("GET /v1/packages/{scope}/{name}/owners", api.serveOwners)
+	mux.HandleFunc("PUT /v1/packages/{name}/owners", api.serveOwnerChange(true))
+	mux.HandleFunc("PUT /v1/packages/{scope}/{name}/owners", api.serveOwnerChange(true))
+	mux.HandleFunc("DELETE /v1/packages/{name}/owners", api.serveOwnerChange(false))
+	mux.HandleFunc("DELETE /v1/packages/{scope}/{name}/owners", api.serveOwnerChange(false))
+
+	mux.HandleFunc("GET /v1/me/tokens", api.serveTokenList)
+	mux.HandleFunc("POST /v1/me/tokens", api.serveTokenCreate)
+	mux.HandleFunc("DELETE /v1/me/tokens/{token}", api.serveTokenRevoke)
+
+	mux.HandleFunc("GET /v1/search", api.serveSearch)
+	mux.HandleFunc("GET /v1/packages/{name}", api.servePackage)
+	mux.HandleFunc("GET /v1/packages/{scope}/{name}", api.servePackage)
+
+	mux.HandleFunc("GET /v1/auth/github", api.serveSignIn)
+	mux.HandleFunc("GET /v1/auth/github/callback", api.serveSignInCallback)
+
 	// registered under GET rather than bare, so a wrong method still resolves to 405
 	// instead of being swallowed here as a 404
 	mux.HandleFunc("GET /", api.serveUnknown)
 
-	return observed(mux, dependencies.Logger)
+	return observed(crossOrigin(mux), dependencies.Logger, api.metrics)
 }
 
 // serveHealth answers whether the process is running, and deliberately touches nothing
@@ -149,6 +181,8 @@ func (a *API) serveIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	document, cached := a.documents.Lookup(name.Normalized(), modified)
+	a.metrics.indexCache(cached)
+
 	if !cached {
 		pkg, err := a.Store.Package(r.Context(), name)
 		switch {

@@ -52,7 +52,12 @@ func (s *Store) Record(ctx context.Context, record publish.Record) error {
 			}
 		}
 
-		_, err = transaction.Exec(ctx, `UPDATE packages SET updated_at = now() WHERE id = $1`, packageID)
+		// description is denormalised onto the package for searching and listing; the most
+		// recent publish's wins, so an old patch released afterwards leaves a staler
+		// subtitle rather than a wrong one
+		_, err = transaction.Exec(ctx,
+			`UPDATE packages SET updated_at = now(), description = $2 WHERE id = $1`,
+			packageID, nilIfEmpty(published.Description))
 		return err
 	})
 }

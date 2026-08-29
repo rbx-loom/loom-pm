@@ -19,7 +19,7 @@ type contextKey struct{}
 //
 // The id is minted here rather than read from the request: a client-supplied one would let
 // anybody collide with, or forge, an entry in the registry's own logs.
-func observed(handler http.Handler, logger *slog.Logger) http.Handler {
+func observed(handler http.Handler, logger *slog.Logger, measured *metrics) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := newRequestID()
 		w.Header().Set(RequestIDHeader, id)
@@ -28,7 +28,13 @@ func observed(handler http.Handler, logger *slog.Logger) http.Handler {
 		recorder := &recordingWriter{ResponseWriter: w, status: http.StatusOK}
 
 		started := time.Now()
+
+		measured.inFlight.Add(1)
 		handler.ServeHTTP(recorder, r)
+		measured.inFlight.Add(-1)
+
+		took := time.Since(started)
+		measured.observe(route(r.URL.Path), recorder.status, took)
 
 		logger.InfoContext(r.Context(), "served",
 			"request", id,
@@ -36,7 +42,7 @@ func observed(handler http.Handler, logger *slog.Logger) http.Handler {
 			"path", r.URL.Path,
 			"status", recorder.status,
 			"bytes", recorder.written,
-			"duration", time.Since(started))
+			"duration", took)
 	})
 }
 

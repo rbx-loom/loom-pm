@@ -15,6 +15,10 @@ var (
 	ErrNotOwned         = errors.New("publish: the package belongs to someone else")
 	ErrSquatted         = errors.New("publish: the name is too close to one already taken")
 	ErrNotScopeMember   = errors.New("publish: not a member of that scope")
+
+	// ErrLastOwner refuses a removal that would leave a package with no owner, which is a
+	// package nobody can publish to or yank again.
+	ErrLastOwner = errors.New("publish: a package must keep one owner")
 )
 
 // InvalidUpload marks a failure the publisher caused and can fix, as against one the

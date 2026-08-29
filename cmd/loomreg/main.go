@@ -1,6 +1,4 @@
 // Command loomreg is the Loom package registry.
-//
-// See DESIGN.md for the API surface and the schema.
 package main
 
 import (
@@ -11,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,8 +25,8 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	// the subcommands bootstrap a self-hosted registry: a credential to publish with, and
-	// a scope to publish into, both of which the serving path only ever reads
+	// the subcommands are what an operator runs against a registry rather than through it:
+	// bootstrapping a credential and a scope, and the two maintenance jobs
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "token":
@@ -39,6 +38,18 @@ func main() {
 		case "scope":
 			if err := createScope(os.Args[2:]); err != nil {
 				logger.Error("could not create the scope", "error", err)
+				os.Exit(1)
+			}
+			return
+		case "sweep":
+			if err := sweepBlobs(os.Args[2:]); err != nil {
+				logger.Error("could not sweep", "error", err)
+				os.Exit(1)
+			}
+			return
+		case "verify":
+			if err := verifyBlobs(os.Args[2:]); err != nil {
+				logger.Error("the store is not sound", "error", err)
 				os.Exit(1)
 			}
 			return
@@ -55,6 +66,11 @@ type config struct {
 	address     string
 	databaseURL string
 	blobRoot    string
+
+	baseURL      string
+	clientID     string
+	clientSecret string
+	metricsToken string
 }
 
 func configure() (config, error) {
@@ -62,10 +78,28 @@ func configure() (config, error) {
 		address:     valueOr("LOOM_ADDRESS", ":8080"),
 		databaseURL: os.Getenv("LOOM_DATABASE_URL"),
 		blobRoot:    valueOr("LOOM_BLOB_ROOT", "var/blobs"),
+
+		baseURL:      os.Getenv("LOOM_BASE_URL"),
+		clientID:     os.Getenv("LOOM_GITHUB_CLIENT_ID"),
+		clientSecret: os.Getenv("LOOM_GITHUB_CLIENT_SECRET"),
+		metricsToken: os.Getenv("LOOM_METRICS_TOKEN"),
 	}
 
 	if loaded.databaseURL == "" {
 		return config{}, errors.New("LOOM_DATABASE_URL is not set")
+	}
+
+	// all three or none: a half-configured sign-in fails at the callback, which is after
+	// somebody has already been sent to GitHub
+	configured := 0
+	for _, value := range []string{loaded.baseURL, loaded.clientID, loaded.clientSecret} {
+		if value != "" {
+			configured++
+		}
+	}
+
+	if configured != 0 && configured != 3 {
+		return config{}, errors.New("set all of LOOM_BASE_URL, LOOM_GITHUB_CLIENT_ID and LOOM_GITHUB_CLIENT_SECRET, or none")
 	}
 
 	return loaded, nil
@@ -102,6 +136,14 @@ func run(logger *slog.Logger) error {
 	blobs := storage.NewFilesystem(settings.blobRoot)
 	limits := publish.DefaultLimits()
 
+	// nil when unconfigured, which the sign-in endpoints answer as 503 rather than failing
+	var provider auth.Provider
+	if settings.clientID != "" {
+		provider = auth.NewGitHub(settings.clientID, settings.clientSecret,
+			strings.TrimSuffix(settings.baseURL, "/")+"/v1/auth/github/callback")
+		logger.Info("sign-in configured", "base", settings.baseURL)
+	}
+
 	recorder := usage.NewRecorder(store, usageInterval, logger)
 	go recorder.Run(ctx)
 
@@ -113,8 +155,14 @@ func run(logger *slog.Logger) error {
 			Publisher:     publish.NewService(store, blobs, limits),
 			Authenticator: auth.New(store),
 			Yanker:        store,
+			Owners:        store,
+			Tokens:        store,
+			Provider:      provider,
+			Users:         store,
+			Catalog:       store,
 			Usage:         recorder,
 			Limits:        limits,
+			MetricsToken:  settings.metricsToken,
 			Logger:        logger,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,

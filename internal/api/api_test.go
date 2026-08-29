@@ -82,6 +82,8 @@ func testServer(t *testing.T, store index.Store) (http.Handler, storage.Digest) 
 		Publisher:     publish.NewService(&fakePublishStore{}, blobs, publish.DefaultLimits()),
 		Authenticator: auth.New(fakeAuth{}),
 		Yanker:        &fakeYanker{},
+		Owners:        &fakeOwners{owners: map[string][]string{}},
+		Tokens:        &fakeTokens{},
 		Logger:        slog.New(slog.DiscardHandler),
 	}), digest
 }
@@ -95,6 +97,11 @@ type harness struct {
 	limits       publish.Limits
 	publishStore *fakePublishStore
 	yanker       *fakeYanker
+	owners       *fakeOwners
+	tokens       *fakeTokens
+	provider     *fakeProvider
+	users        *fakeUsers
+	catalog      *fakeCatalog
 }
 
 func newHarness(t *testing.T) *harness {
@@ -108,6 +115,11 @@ func newHarness(t *testing.T) *harness {
 	blobs := storage.NewFilesystem(t.TempDir())
 	store := &fakePublishStore{}
 	yanker := &fakeYanker{}
+	owners := &fakeOwners{owners: map[string][]string{"serio": {"ada"}}}
+	tokens := &fakeTokens{}
+	provider := &fakeProvider{identity: auth.Identity{GitHubID: 4242, Login: "ada"}}
+	users := &fakeUsers{id: 7}
+	browsing := catalogWith(t, "serio")
 	limits := publish.DefaultLimits()
 
 	return &harness{
@@ -117,6 +129,11 @@ func newHarness(t *testing.T) *harness {
 			Publisher:     publish.NewService(store, blobs, limits),
 			Authenticator: auth.New(fakeAuth{tokens: map[string]auth.User{string(hash): {ID: 7, Login: "ada"}}}),
 			Yanker:        yanker,
+			Owners:        owners,
+			Tokens:        tokens,
+			Provider:      provider,
+			Users:         users,
+			Catalog:       browsing,
 			Limits:        limits,
 			Logger:        slog.New(slog.DiscardHandler),
 		}),
@@ -125,7 +142,54 @@ func newHarness(t *testing.T) *harness {
 		limits:       limits,
 		publishStore: store,
 		yanker:       yanker,
+		owners:       owners,
+		tokens:       tokens,
+		provider:     provider,
+		users:        users,
+		catalog:      browsing,
 	}
+}
+
+// newHarnessWithMetricsToken is a registry whose operator put /metrics behind a token.
+func newHarnessWithMetricsToken(t *testing.T, token string) *harness {
+	t.Helper()
+
+	built := newHarness(t)
+	blobs := storage.NewFilesystem(t.TempDir())
+
+	built.handler = New(Dependencies{
+		Store:         storeWith(t, "serio"),
+		Blobs:         blobs,
+		Publisher:     publish.NewService(&fakePublishStore{}, blobs, publish.DefaultLimits()),
+		Authenticator: auth.New(fakeAuth{}),
+		Yanker:        &fakeYanker{},
+		Owners:        &fakeOwners{owners: map[string][]string{}},
+		Tokens:        &fakeTokens{},
+		MetricsToken:  token,
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+
+	return built
+}
+
+// newHarnessWithout is a registry whose operator never configured sign-in, which is every
+// self-hosted one that mints its tokens from the command line.
+func newHarnessWithout(t *testing.T) *harness {
+	t.Helper()
+
+	built := newHarness(t)
+	built.handler = New(Dependencies{
+		Store:         storeWith(t, "serio"),
+		Blobs:         storage.NewFilesystem(t.TempDir()),
+		Publisher:     publish.NewService(&fakePublishStore{}, storage.NewFilesystem(t.TempDir()), publish.DefaultLimits()),
+		Authenticator: auth.New(fakeAuth{}),
+		Yanker:        &fakeYanker{},
+		Owners:        &fakeOwners{owners: map[string][]string{}},
+		Tokens:        &fakeTokens{},
+		Logger:        slog.New(slog.DiscardHandler),
+	})
+
+	return built
 }
 
 func publishableTarball(t *testing.T) []byte {
