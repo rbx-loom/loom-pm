@@ -1,0 +1,36 @@
+# Template. deploy/tunnel.sh renders this to /etc/cloudflared/config.yml with the real
+# hostnames substituted — do not edit the rendered copy, edit this and re-run the script.
+#
+# A NAMED tunnel. A quick tunnel's hostname changes every restart, and this hostname ends
+# up in the compiler's DefaultIndex, in every loom-config.toml, and in the `source` field
+# of every lock file resolved against it.
+#
+# Those lock files are why a published hostname can never be retired. They are not why it
+# can never be added to: the registry serves the same bytes whatever name they arrive on,
+# because nothing it returns contains a URL. Pass tunnel.sh several hostnames and every one
+# of them works, forever, side by side.
+
+tunnel: __TUNNEL_NAME__
+credentials-file: __CREDENTIALS_FILE__
+
+ingress:
+# >>> repeated once per hostname given to tunnel.sh — edit here, not in the rendered copy
+  - hostname: __HOSTNAME__
+    service: __ORIGIN__
+    originRequest:
+      connectTimeout: 10s
+
+      # A publish is a 5 MB upload over whatever connection the publisher has, and the
+      # origin's own write timeout is two minutes; the tunnel should not be the half that
+      # gives up first.
+      httpHostHeader: __HOSTNAME__
+# <<<
+
+  # cloudflared requires a catch-all last, and this one is deliberate: a hostname routed to
+  # this tunnel that is not listed above is a DNS record somebody made by hand.
+  - service: http_status:404
+
+# Caching is Cloudflare's side of this, and the origin already asks for what it needs:
+# tarballs go out `public, max-age=31536000, immutable` and index documents go out
+# `max-age=60, stale-while-revalidate=600`. Leave "Respect Existing Headers" on rather than
+# setting a blanket Edge Cache TTL, or a new version stays unresolvable for the TTL.

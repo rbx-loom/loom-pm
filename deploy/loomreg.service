@@ -1,0 +1,76 @@
+# /etc/systemd/system/loomreg.service
+#
+# One VPS: Postgres and this binary on the same box, cloudflared in front. No container
+# orchestration — there is one process, and the thing that restarts it is already here.
+
+[Unit]
+Description=Loom package registry
+Documentation=https://github.com/rbx-loom/loom-pm
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+# Requires rather than Wants: loomreg migrates on boot, and a start that cannot reach the
+# database is a crash loop that says nothing useful.
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=loomreg
+Group=loomreg
+
+# LOOM_DATABASE_URL and the GitHub client secret live here, so it is not world-readable.
+# Ship deploy/loomreg.env.example to /etc/loomreg.env and fill it in: 0640 root:loomreg.
+EnvironmentFile=/etc/loomreg.env
+
+# /var/lib/loomreg, created and chowned by systemd. The blob root goes under it, which is
+# what makes the backup a single rsync of one directory.
+StateDirectory=loomreg
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/loomreg
+
+ExecStart=/usr/local/bin/loomreg
+
+# The process shuts down on its own within 20 seconds; this is the backstop for one that
+# does not, and it is longer so that a slow shutdown is not mistaken for a hung one.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# A publish holds a blob write open, so give in-flight requests the shutdown the process
+# already implements rather than killing the group under them.
+KillMode=mixed
+
+# Hardening. The registry reads a socket, a database and one directory, and nothing here
+# is exotic enough to need an exception.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# AF_UNIX as well as TCP: a Postgres on the same box is reached over a socket unless the
+# connection string says otherwise.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Tarballs are held open one per in-flight request, and the default is not generous once a
+# connection pool and a listener have taken theirs.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

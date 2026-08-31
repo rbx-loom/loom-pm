@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly Loom registry backup
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 UTC
+
+# A box that was off at 04:15 backs up when it comes back, rather than skipping the night.
+Persistent=true
+
+# So a fleet of these would not all wake at once, and so the backup does not land on the
+# same second as every other cron job on the box.
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

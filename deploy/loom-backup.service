@@ -1,0 +1,31 @@
+[Unit]
+Description=Back up the Loom registry (database dump + blob store)
+Documentation=file:/usr/local/bin/loom-backup.sh
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=loomreg
+Group=loomreg
+
+# Stated, not inherited: GNU find calls getcwd() at startup and fails outright when the
+# working directory is one the service user cannot stat.
+WorkingDirectory=/
+
+# Reads LOOM_BLOB_ROOT from the service's own config so the two can never disagree about
+# where the blobs are, and BACKUP_* from the backup one.
+EnvironmentFile=/etc/loomreg.env
+EnvironmentFile=-/etc/loomreg-backup.env
+
+ExecStart=/usr/local/bin/loom-backup.sh
+
+# Shipping a blob store over a slow link is allowed to take a while; hanging forever is not.
+TimeoutStartSec=2h
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/loomreg
+ReadOnlyPaths=/var/lib/loomreg

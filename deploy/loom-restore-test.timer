@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly check that the newest Loom backup actually restores
+
+[Timer]
+# Sunday, well after the nightly dump has been taken and shipped.
+OnCalendar=Sun *-*-* 05:30:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
