@@ -19,7 +19,7 @@ func user(t *testing.T, pool *pgxpool.Pool, login string) int64 {
 
 	var id int64
 	err := pool.QueryRow(context.Background(),
-		`INSERT INTO users (github_id, login) VALUES (-nextval('users_id_seq'), $1) RETURNING id`,
+		`INSERT INTO users (login) VALUES ($1) RETURNING id`,
 		login).Scan(&id)
 	if err != nil {
 		t.Fatalf("creating %q: %v", login, err)

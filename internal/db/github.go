@@ -32,11 +32,11 @@ func (s *Store) UpsertGitHubUser(ctx context.Context, identity auth.Identity) (i
 			return fmt.Errorf("db: updating the user for %d: %w", identity.GitHubID, err)
 		}
 
-		// a bootstrapped user carries a placeholder github_id, which is negative because
-		// a real one never is
+		// a bootstrapped user is one whose github_id is still NULL: they were created from
+		// the command line and have never signed in
 		err = transaction.QueryRow(ctx, `
 			UPDATE users SET github_id = $1, login = $2, avatar_url = $3
-			WHERE lower(login) = lower($2) AND github_id < 0
+			WHERE lower(login) = lower($2) AND github_id IS NULL
 			RETURNING id`,
 			identity.GitHubID, identity.Login, nilIfEmpty(identity.AvatarURL),
 		).Scan(&userID)

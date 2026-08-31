@@ -48,11 +48,11 @@ func (s *Store) IssueToken(ctx context.Context, login, name string) (string, err
 
 		err := transaction.QueryRow(ctx, `SELECT id FROM users WHERE login = $1`, login).Scan(&userID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			// github_id is the identity a real login supplies; a bootstrapped user has
-			// none yet, so it is derived and replaced when they first sign in
+			// github_id is the identity a real login supplies, and a bootstrapped user has
+			// none yet: the column is left NULL until they first sign in, which is what
+			// UpsertGitHubUser looks for when it adopts them
 			err = transaction.QueryRow(ctx,
-				`INSERT INTO users (github_id, login) VALUES (-nextval('users_id_seq'), $1) RETURNING id`,
-				login).Scan(&userID)
+				`INSERT INTO users (login) VALUES ($1) RETURNING id`, login).Scan(&userID)
 		}
 		if err != nil {
 			return fmt.Errorf("db: finding or creating %q: %w", login, err)

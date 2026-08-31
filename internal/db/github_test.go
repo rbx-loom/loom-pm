@@ -8,12 +8,14 @@ import (
 )
 
 // loginAndGitHubID reads back what a user row now says, which is how adoption is checked.
-func loginAndGitHubID(t *testing.T, store *Store, userID int64) (string, int64) {
+// The id is a pointer because a user who has never signed in has none: that absence is the
+// thing UpsertGitHubUser looks for.
+func loginAndGitHubID(t *testing.T, store *Store, userID int64) (string, *int64) {
 	t.Helper()
 
 	var (
 		login string
-		id    int64
+		id    *int64
 	)
 
 	err := store.pool.QueryRow(context.Background(),
@@ -37,8 +39,8 @@ func TestUpsertGitHubUserCreates(t *testing.T) {
 	}
 
 	login, id := loginAndGitHubID(t, store, userID)
-	if login != "ada" || id != 4242 {
-		t.Errorf("stored %q/%d, want ada/4242", login, id)
+	if id == nil || login != "ada" || *id != 4242 {
+		t.Errorf("stored %q/%v, want ada/4242", login, id)
 	}
 }
 
@@ -86,6 +88,12 @@ func TestUpsertGitHubUserAdoptsABootstrappedUser(t *testing.T) {
 		t.Fatalf("UserByTokenHash: %v", err)
 	}
 
+	// no identity yet, and that absence is NULL rather than a number standing in for one:
+	// a placeholder is a value every query then has to know how to disbelieve
+	if _, id := loginAndGitHubID(t, store, before.ID); id != nil {
+		t.Errorf("a bootstrapped user carries github_id %d, want none at all", *id)
+	}
+
 	adopted, err := store.UpsertGitHubUser(ctx, auth.Identity{GitHubID: 4242, Login: "Ada"})
 	if err != nil {
 		t.Fatalf("UpsertGitHubUser: %v", err)
@@ -96,8 +104,8 @@ func TestUpsertGitHubUserAdoptsABootstrappedUser(t *testing.T) {
 	}
 
 	login, id := loginAndGitHubID(t, store, adopted)
-	if id != 4242 {
-		t.Errorf("github_id = %d, want the real one", id)
+	if id == nil || *id != 4242 {
+		t.Errorf("github_id = %v, want the real one", id)
 	}
 
 	if login != "Ada" {
@@ -131,7 +139,7 @@ func TestUpsertGitHubUserDoesNotAdoptASignedInUser(t *testing.T) {
 		t.Fatal("two GitHub identities were folded into one user")
 	}
 
-	if _, id := loginAndGitHubID(t, store, first); id != 4242 {
-		t.Errorf("the first user's github_id changed to %d", id)
+	if _, id := loginAndGitHubID(t, store, first); id == nil || *id != 4242 {
+		t.Errorf("the first user's github_id changed to %v", id)
 	}
 }
