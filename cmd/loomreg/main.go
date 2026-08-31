@@ -159,6 +159,7 @@ func run(logger *slog.Logger) error {
 			Tokens:        store,
 			Provider:      provider,
 			Users:         store,
+			Sessions:      store,
 			Catalog:       store,
 			Usage:         recorder,
 			Limits:        limits,

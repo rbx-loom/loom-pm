@@ -67,6 +67,7 @@ type Dependencies struct {
 	Tokens        Tokens
 	Provider      auth.Provider
 	Users         Users
+	Sessions      Sessions
 	Catalog       catalog.Store
 	Usage         Usage
 	Limits        publish.Limits
@@ -145,6 +146,7 @@ func New(dependencies Dependencies) http.Handler {
 
 	mux.HandleFunc("GET /v1/auth/github", api.serveSignIn)
 	mux.HandleFunc("GET /v1/auth/github/callback", api.serveSignInCallback)
+	mux.HandleFunc("POST /v1/auth/signout", api.serveSignOut)
 
 	// registered under GET rather than bare, so a wrong method still resolves to 405
 	// instead of being swallowed here as a 404

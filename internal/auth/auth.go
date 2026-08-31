@@ -19,9 +19,18 @@ import (
 // committed by accident.
 const TokenPrefix = "loom_pat_"
 
-const tokenBytes = 32
+// SessionPrefix marks the value of a sign-in cookie. Nobody types one, but one does end up
+// in a pasted request now and then, and a scanner that knows the shape can say so.
+const SessionPrefix = "loom_ses_"
+
+const secretBytes = 32
 
 var ErrUnauthenticated = errors.New("auth: no such token")
+
+// ErrNoSession is answered when a request carries no sign-in, or one that has expired or
+// been signed out. It is separate from ErrUnauthenticated because the two are answered
+// differently: a request with a good token and no session is refused, not challenged.
+var ErrNoSession = errors.New("auth: no such session")
 
 type User struct {
 	ID    int64
@@ -33,17 +42,27 @@ type User struct {
 }
 
 // NewToken answers the token to show its owner once, and the hash to store.
-func NewToken() (string, []byte, error) {
-	secret := make([]byte, tokenBytes)
+func NewToken() (string, []byte, error) { return newSecret(TokenPrefix, "token") }
+
+func HashToken(presented string) []byte { return hashSecret(presented) }
+
+// NewSession answers the value a browser is given and the hash to store. A session is
+// generated the same way a token is; what separates them is what each may do.
+func NewSession() (string, []byte, error) { return newSecret(SessionPrefix, "session") }
+
+func HashSession(presented string) []byte { return hashSecret(presented) }
+
+func newSecret(prefix, what string) (string, []byte, error) {
+	secret := make([]byte, secretBytes)
 	if _, err := rand.Read(secret); err != nil {
-		return "", nil, fmt.Errorf("auth: generating a token: %w", err)
+		return "", nil, fmt.Errorf("auth: generating a %s: %w", what, err)
 	}
 
-	presented := TokenPrefix + base64.RawURLEncoding.EncodeToString(secret)
-	return presented, HashToken(presented), nil
+	presented := prefix + base64.RawURLEncoding.EncodeToString(secret)
+	return presented, hashSecret(presented), nil
 }
 
-func HashToken(presented string) []byte {
+func hashSecret(presented string) []byte {
 	hash := sha256.Sum256([]byte(presented))
 	return hash[:]
 }

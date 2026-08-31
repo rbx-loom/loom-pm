@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rbx-loom/loom-pm/internal/auth"
 )
@@ -31,6 +32,59 @@ func (f *fakeProvider) Identify(_ context.Context, code string) (auth.Identity, 
 	return f.identity, nil
 }
 
+// fakeSessions is the session store, in a map. Expiry is modelled as a deadline rather
+// than a duration so that a test can age a session without sleeping.
+type fakeSessions struct {
+	live map[string]sessionRow
+	now  time.Time
+	err  error
+}
+
+type sessionRow struct {
+	userID  int64
+	expires time.Time
+}
+
+func newFakeSessions() *fakeSessions {
+	return &fakeSessions{live: map[string]sessionRow{}, now: time.Date(2026, 3, 14, 9, 21, 0, 0, time.UTC)}
+}
+
+func (f *fakeSessions) CreateSession(_ context.Context, userID int64, lifetime time.Duration) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+
+	presented, hash, err := auth.NewSession()
+	if err != nil {
+		return "", err
+	}
+
+	f.live[string(hash)] = sessionRow{userID: userID, expires: f.now.Add(lifetime)}
+	return presented, nil
+}
+
+func (f *fakeSessions) UserBySessionHash(_ context.Context, hash []byte) (auth.User, error) {
+	if f.err != nil {
+		return auth.User{}, f.err
+	}
+
+	row, ok := f.live[string(hash)]
+	if !ok || !row.expires.After(f.now) {
+		return auth.User{}, auth.ErrNoSession
+	}
+
+	return auth.User{ID: row.userID, Login: "ada"}, nil
+}
+
+func (f *fakeSessions) RevokeSession(_ context.Context, hash []byte) error {
+	if f.err != nil {
+		return f.err
+	}
+
+	delete(f.live, string(hash))
+	return nil
+}
+
 type fakeUsers struct {
 	upserted []auth.Identity
 	id       int64
@@ -44,6 +98,27 @@ func (f *fakeUsers) UpsertGitHubUser(_ context.Context, identity auth.Identity) 
 
 	f.upserted = append(f.upserted, identity)
 	return f.id, nil
+}
+
+// signIn drives a whole sign-in and answers the session cookie the registry set, which is
+// what the endpoints a token may not reach ask for.
+func (h *harness) signIn(t *testing.T) *http.Cookie {
+	t.Helper()
+
+	state, started := h.begin(t)
+	response := h.callback(t, "code=the-code&state="+url.QueryEscape(state), started)
+	if response.Code != http.StatusOK {
+		t.Fatalf("signing in = %d, want 200: %s", response.Code, response.Body)
+	}
+
+	for _, cookie := range (&http.Response{Header: response.Header()}).Cookies() {
+		if cookie.Name == "loom_session" && cookie.Value != "" {
+			return cookie
+		}
+	}
+
+	t.Fatal("the sign-in set no session cookie")
+	return nil
 }
 
 // begin starts a sign-in and answers the state the registry chose along with the cookie it
@@ -228,5 +303,86 @@ func TestSignInUnconfigured(t *testing.T) {
 				t.Error("the refusal carried no diagnostic")
 			}
 		})
+	}
+}
+
+// A sign-in has to leave the browser holding something, or the token it just showed is the
+// last one that browser will ever be able to make.
+func TestSignInSetsASession(t *testing.T) {
+	harness := newHarness(t)
+
+	session := harness.signIn(t)
+
+	if !session.HttpOnly {
+		t.Error("the session cookie is readable by scripts")
+	}
+
+	if session.SameSite != http.SameSiteLaxMode {
+		t.Errorf("SameSite = %v, want Lax so a cross-site POST does not carry it", session.SameSite)
+	}
+
+	if session.Path != "/" {
+		t.Errorf("Path = %q, want / so /v1/me sees it", session.Path)
+	}
+
+	if !strings.HasPrefix(session.Value, auth.SessionPrefix) {
+		t.Errorf("the session value %q carries no prefix a scanner would know", session.Value)
+	}
+
+	if len(harness.sessions.live) != 1 {
+		t.Errorf("the registry recorded %d sessions, want 1", len(harness.sessions.live))
+	}
+}
+
+// Behind a terminating proxy this process is spoken to over plain HTTP while the browser
+// is on https, and a session cookie sent without Secure there is one that will travel over
+// http:// the next time somebody types the host without a scheme.
+func TestSessionCookieIsSecureBehindAProxy(t *testing.T) {
+	harness := newHarness(t)
+	state, started := harness.begin(t)
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/v1/auth/github/callback?code=the-code&state="+url.QueryEscape(state), nil)
+	request.AddCookie(started)
+	request.Header.Set("X-Forwarded-Proto", "https")
+
+	recorder := httptest.NewRecorder()
+	harness.handler.ServeHTTP(recorder, request)
+
+	for _, cookie := range (&http.Response{Header: recorder.Header()}).Cookies() {
+		if cookie.Name == "loom_session" && !cookie.Secure {
+			t.Error("the session cookie went out without Secure behind an https proxy")
+		}
+	}
+}
+
+func TestSignOutEndsTheSession(t *testing.T) {
+	harness := newHarness(t)
+	session := harness.signIn(t)
+
+	response := sendAs(t, harness.handler, http.MethodPost, "/v1/auth/signout", session, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("signing out = %d, want 200: %s", response.Code, response.Body)
+	}
+
+	if len(harness.sessions.live) != 0 {
+		t.Errorf("%d sessions survived signing out", len(harness.sessions.live))
+	}
+
+	// and the session it held mints nothing afterwards
+	minted := sendAs(t, harness.handler, http.MethodPost, "/v1/me/tokens", session, `{"name":"after"}`)
+	if minted.Code != http.StatusUnauthorized {
+		t.Errorf("minting after signing out = %d, want 401: %s", minted.Code, minted.Body)
+	}
+}
+
+// Signing out with nothing to sign out of is what a browser does when its cookie has
+// already expired. It is the state that was asked for, so it is not a failure.
+func TestSignOutWithoutASessionSucceeds(t *testing.T) {
+	harness := newHarness(t)
+
+	response := send(t, harness.handler, http.MethodPost, "/v1/auth/signout", "", "")
+	if response.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200: %s", response.Code, response.Body)
 	}
 }

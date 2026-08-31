@@ -97,6 +97,23 @@ func (f *fakeTokens) RevokeToken(_ context.Context, _ int64, tokenID int64) erro
 	return nil
 }
 
+// sendAs is send for a browser: a session cookie instead of an Authorization header.
+func sendAs(t *testing.T, handler http.Handler, method, target string, session *http.Cookie, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+
+	request := httptest.NewRequest(method, target, reader)
+	request.AddCookie(session)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
 func send(t *testing.T, handler http.Handler, method, target, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -261,10 +278,13 @@ func TestTokensList(t *testing.T) {
 	}
 }
 
+// Minting takes the sign-in, which is the whole point of refusing the token: the
+// credential that makes credentials is the one somebody holding a stolen token cannot get.
 func TestTokensCreateShowsTheSecretOnce(t *testing.T) {
 	harness := newHarness(t)
+	session := harness.signIn(t)
 
-	response := send(t, harness.handler, http.MethodPost, "/v1/me/tokens", harness.token, `{"name":"ci"}`)
+	response := sendAs(t, harness.handler, http.MethodPost, "/v1/me/tokens", session, `{"name":"ci"}`)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201: %s", response.Code, response.Body)
 	}
@@ -293,10 +313,11 @@ func TestTokensCreateShowsTheSecretOnce(t *testing.T) {
 
 func TestTokensCreateRequiresAName(t *testing.T) {
 	harness := newHarness(t)
+	session := harness.signIn(t)
 
 	for _, body := range []string{`{}`, `{"name":"  "}`, ``, `nonsense`} {
 		t.Run(body, func(t *testing.T) {
-			response := send(t, harness.handler, http.MethodPost, "/v1/me/tokens", harness.token, body)
+			response := sendAs(t, harness.handler, http.MethodPost, "/v1/me/tokens", session, body)
 			if response.Code != http.StatusBadRequest {
 				t.Errorf("status = %d, want 400", response.Code)
 			}
@@ -353,14 +374,83 @@ func TestTokensRequireAToken(t *testing.T) {
 	}
 }
 
-// A token may mint another, so a leaked one can outlive the revocation of itself. That is
-// the cost of having no web session yet; the test records the behaviour so that closing it
-// later is a deliberate change rather than a surprise.
-func TestTokensCanMintTokens(t *testing.T) {
+// A token may not mint another. Were it able to, a leaked token would outlive the
+// revocation of itself: whoever took it makes a second before anybody notices, and
+// revoking the one that leaked closes nothing.
+//
+// It is refused rather than challenged, because there is no token the caller could send
+// instead that would work.
+func TestTokensCannotMintTokens(t *testing.T) {
 	harness := newHarness(t)
 
 	response := send(t, harness.handler, http.MethodPost, "/v1/me/tokens", harness.token, `{"name":"second"}`)
-	if response.Code != http.StatusCreated {
-		t.Errorf("status = %d, want 201", response.Code)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403: %s", response.Code, response.Body)
+	}
+
+	if !strings.Contains(response.Body.String(), "/v1/auth/github") {
+		t.Errorf("the refusal does not say where a token comes from: %s", response.Body)
+	}
+
+	if len(harness.tokens.summaries) != 0 {
+		t.Errorf("a token was minted anyway: %v", harness.tokens.summaries)
+	}
+}
+
+// A registry nobody can sign in to still refuses, and says the only other way a token is
+// made there: the operator's command line.
+func TestTokenMintingWithoutSignInSaysSo(t *testing.T) {
+	harness := newHarnessWithout(t)
+
+	response := send(t, harness.handler, http.MethodPost, "/v1/me/tokens", harness.token, `{"name":"second"}`)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401: %s", response.Code, response.Body)
+	}
+
+	if !strings.Contains(response.Body.String(), "ask whoever runs it") {
+		t.Errorf("the refusal does not say where a token comes from: %s", response.Body)
+	}
+}
+
+// An expired session is no session: it mints nothing, and says the same as none at all.
+func TestAnExpiredSessionMintsNothing(t *testing.T) {
+	harness := newHarness(t)
+	session := harness.signIn(t)
+
+	harness.sessions.now = harness.sessions.now.Add(sessionLifetime + time.Hour)
+
+	response := sendAs(t, harness.handler, http.MethodPost, "/v1/me/tokens", session, `{"name":"second"}`)
+	if response.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401: %s", response.Code, response.Body)
+	}
+}
+
+// Listing and revoking still take a token. Neither raises what its caller may already do,
+// and revoking is how somebody closes a leak they have just noticed — from wherever they
+// noticed it.
+func TestListingAndRevokingStillTakeAToken(t *testing.T) {
+	harness := newHarness(t)
+
+	if response := send(t, harness.handler, http.MethodGet, "/v1/me/tokens", harness.token, ""); response.Code != http.StatusOK {
+		t.Errorf("listing = %d, want 200: %s", response.Code, response.Body)
+	}
+
+	if response := send(t, harness.handler, http.MethodDelete, "/v1/me/tokens/42", harness.token, ""); response.Code != http.StatusOK {
+		t.Errorf("revoking = %d, want 200: %s", response.Code, response.Body)
+	}
+}
+
+// A session reaches them too, so a browser is not required to hold a token to manage its
+// own.
+func TestListingAndRevokingTakeASession(t *testing.T) {
+	harness := newHarness(t)
+	session := harness.signIn(t)
+
+	if response := sendAs(t, harness.handler, http.MethodGet, "/v1/me/tokens", session, ""); response.Code != http.StatusOK {
+		t.Errorf("listing = %d, want 200: %s", response.Code, response.Body)
+	}
+
+	if response := sendAs(t, harness.handler, http.MethodDelete, "/v1/me/tokens/42", session, ""); response.Code != http.StatusOK {
+		t.Errorf("revoking = %d, want 200: %s", response.Code, response.Body)
 	}
 }

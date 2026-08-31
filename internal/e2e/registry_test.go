@@ -45,6 +45,10 @@ type registry struct {
 	store    *db.Store
 	blobs    *storage.Filesystem
 	blobRoot string
+
+	// the pool the store is built on, for the few assertions whose subject is the schema
+	// rather than anything the store exposes
+	pool *pgxpool.Pool
 }
 
 // logTo sends the server's log to the test, so a swallowed 500 explains itself in the
@@ -97,6 +101,7 @@ func start(t *testing.T) *registry {
 		Yanker:        store,
 		Owners:        store,
 		Tokens:        store,
+		Sessions:      store,
 		Limits:        limits,
 		Logger:        slog.New(slog.NewTextHandler(logTo{t}, nil)),
 	})
@@ -111,7 +116,7 @@ func start(t *testing.T) *registry {
 
 	return &registry{
 		url: server.URL, token: token, client: server.Client(),
-		store: store, blobs: blobs, blobRoot: blobRoot,
+		store: store, blobs: blobs, blobRoot: blobRoot, pool: pool,
 	}
 }
 
@@ -543,5 +548,51 @@ func TestSweepSparesPublishedBlobs(t *testing.T) {
 	// and the package is still downloadable, which is the thing that actually matters
 	if status, _ := registry.do(t, http.MethodGet, "/v1/packages/serio/1.0.0/download", nil, false); status != http.StatusOK {
 		t.Errorf("downloading after a sweep = %d, want 200", status)
+	}
+}
+
+// A leaked token must not be able to make itself a successor. This is the seam worth
+// proving end to end: the refusal is a handler decision, but what makes it hold is that
+// there is no session row anywhere for a bearer token to resolve to.
+func TestATokenCannotMintAnotherToken(t *testing.T) {
+	registry := start(t)
+
+	// 403 rather than 401: the token is good, and there is no credential the caller could
+	// send instead that would make this request work
+	status, body := registry.do(t, http.MethodPost, "/v1/me/tokens", []byte(`{"name":"successor"}`), true)
+	if status != http.StatusForbidden {
+		t.Fatalf("minting = %d, want 403: %s", status, body)
+	}
+
+	if !strings.Contains(string(body), "ask whoever runs it") {
+		t.Errorf("the refusal does not say where a token comes from here: %s", body)
+	}
+
+	// and the token it holds is still good for everything it was ever for
+	if status, body := registry.do(t, http.MethodGet, "/v1/me/tokens", nil, true); status != http.StatusOK {
+		t.Errorf("listing = %d, want 200: %s", status, body)
+	}
+}
+
+// `loomreg token ada` creates somebody with no GitHub identity. The absence is a NULL, not
+// a number chosen to look unlike one: every query that has to recognise it says IS NULL,
+// and the schema refuses anything that would make that untrue.
+func TestABootstrappedUserHasNoIdentity(t *testing.T) {
+	registry := start(t)
+	ctx := context.Background()
+
+	var identity *int64
+	err := registry.pool.QueryRow(ctx, `SELECT github_id FROM users WHERE login = 'ada'`).Scan(&identity)
+	if err != nil {
+		t.Fatalf("reading the bootstrapped user: %v", err)
+	}
+
+	if identity != nil {
+		t.Errorf("github_id = %d, want none at all", *identity)
+	}
+
+	_, err = registry.pool.Exec(ctx, `UPDATE users SET github_id = -1 WHERE login = 'ada'`)
+	if err == nil {
+		t.Error("a placeholder identity was accepted; the check constraint is not doing its job")
 	}
 }

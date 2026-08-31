@@ -101,6 +101,7 @@ type harness struct {
 	tokens       *fakeTokens
 	provider     *fakeProvider
 	users        *fakeUsers
+	sessions     *fakeSessions
 	catalog      *fakeCatalog
 }
 
@@ -119,6 +120,7 @@ func newHarness(t *testing.T) *harness {
 	tokens := &fakeTokens{}
 	provider := &fakeProvider{identity: auth.Identity{GitHubID: 4242, Login: "ada"}}
 	users := &fakeUsers{id: 7}
+	sessions := newFakeSessions()
 	browsing := catalogWith(t, "serio")
 	limits := publish.DefaultLimits()
 
@@ -133,6 +135,7 @@ func newHarness(t *testing.T) *harness {
 			Tokens:        tokens,
 			Provider:      provider,
 			Users:         users,
+			Sessions:      sessions,
 			Catalog:       browsing,
 			Limits:        limits,
 			Logger:        slog.New(slog.DiscardHandler),
@@ -146,6 +149,7 @@ func newHarness(t *testing.T) *harness {
 		tokens:       tokens,
 		provider:     provider,
 		users:        users,
+		sessions:     sessions,
 		catalog:      browsing,
 	}
 }

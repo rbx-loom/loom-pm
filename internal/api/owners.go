@@ -113,7 +113,7 @@ func (a *API) serveOwnerChange(add bool) http.HandlerFunc {
 }
 
 func (a *API) serveTokenList(w http.ResponseWriter, r *http.Request) {
-	user, ok := a.authenticate(w, r)
+	user, ok := a.authenticateEither(w, r)
 	if !ok {
 		return
 	}
@@ -128,7 +128,7 @@ func (a *API) serveTokenList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) serveTokenCreate(w http.ResponseWriter, r *http.Request) {
-	user, ok := a.authenticate(w, r)
+	user, ok := a.requireSession(w, r)
 	if !ok {
 		return
 	}
@@ -158,7 +158,7 @@ func (a *API) serveTokenCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) serveTokenRevoke(w http.ResponseWriter, r *http.Request) {
-	user, ok := a.authenticate(w, r)
+	user, ok := a.authenticateEither(w, r)
 	if !ok {
 		return
 	}
@@ -177,6 +177,61 @@ func (a *API) serveTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	default:
 		a.render(w, http.StatusOK, map[string]any{"id": tokenID, "revoked": true})
 	}
+}
+
+// requireSession resolves the signed-in user, and is what minting a token needs.
+//
+// A token deliberately does not satisfy it. A token that may mint tokens is one whose leak
+// outlives its own revocation: whoever took it makes a second, and revoking the one that
+// leaked changes nothing. Signing in is the thing somebody holding only a stolen token
+// cannot do, which is what makes it the credential this asks for.
+func (a *API) requireSession(w http.ResponseWriter, r *http.Request) (auth.User, bool) {
+	user, err := a.sessionUser(r)
+	switch {
+	case err == nil:
+		return user, true
+	case !errors.Is(err, auth.ErrNoSession):
+		a.internal(w, r, "check your sign-in", err)
+		return auth.User{}, false
+	}
+
+	// a caller who already holds a good token is refused rather than challenged: there is
+	// no repeating the request with the credential they have that would work
+	status := http.StatusUnauthorized
+	if _, err := a.Authenticator.Authenticate(r.Context(), r.Header.Get("Authorization")); err == nil {
+		status = http.StatusForbidden
+	}
+
+	a.fail(w, r, status, a.mintingAdvice())
+	return auth.User{}, false
+}
+
+// mintingAdvice says where a token comes from on this registry, which depends on whether
+// anybody can sign in to it.
+func (a *API) mintingAdvice() string {
+	if a.Provider == nil || a.Users == nil || a.Sessions == nil {
+		return "a token cannot mint another token, and signing in is not configured on this registry; ask whoever runs it for one."
+	}
+
+	return "a token cannot mint another token; sign in at /v1/auth/github to create one."
+}
+
+// authenticateEither accepts a sign-in or a token.
+//
+// Listing and revoking are things both a browser and the CLI do, and neither raises what
+// its caller may already do: a token that can revoke itself is a leak whoever notices it
+// can close, which is the opposite of the problem minting has.
+func (a *API) authenticateEither(w http.ResponseWriter, r *http.Request) (auth.User, bool) {
+	user, err := a.sessionUser(r)
+	switch {
+	case err == nil:
+		return user, true
+	case !errors.Is(err, auth.ErrNoSession):
+		a.internal(w, r, "check your sign-in", err)
+		return auth.User{}, false
+	}
+
+	return a.authenticate(w, r)
 }
 
 // decode reads a small JSON body, answering false when it has already reported why it
